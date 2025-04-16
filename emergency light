@@ -1,0 +1,43 @@
+/*
+ * 8-LED Strip Control - Full White
+ * 
+ * This code controls an 8-LED strip connected to pin 10,
+ * turning all LEDs to full white brightness.
+ * 
+ * Hardware:
+ * - Arduino board
+ * - 8-LED NeoPixel/WS2812B LED strip
+ * - Connect strip data input to Arduino pin 10
+ * - Connect strip GND to Arduino GND
+ * - Connect strip VCC to 5V (may need external power for longer strips)
+ */
+
+#include <Adafruit_NeoPixel.h>
+
+// Define pin and LED properties
+#define LED_PIN     11    // Pin connected to the LED strip
+#define NUM_LEDS    8     // Number of LEDs in the strip
+#define BRIGHTNESS  255   // Maximum brightness (0-255)
+
+// Initialize the NeoPixel library
+Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+void setup() {
+  strip.begin();           // Initialize the strip
+  strip.setBrightness(BRIGHTNESS);  // Set to full brightness
+  
+  // Turn on all LEDs to white
+  for(int i = 0; i < NUM_LEDS; i++) {
+    strip.setPixelColor(i, strip.Color(255, 255, 255));  // Set to white (RGB: 255,255,255)
+  }
+  
+  strip.show();  // Send the updated pixel colors to the hardware
+  
+  Serial.begin(9600);
+  Serial.println("LED Strip initialized - All LEDs set to white");
+}
+
+void loop() {
+  // Nothing to do here as we're just keeping the LEDs on at full white
+  // You could add code here if you want to respond to inputs or create animations later
+}
