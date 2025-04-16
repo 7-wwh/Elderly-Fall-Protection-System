@@ -10,18 +10,24 @@
 #define BAUD_RATE 9600
 #define CALIBRATION_TIME 5000
 #define CALIBRATION_INTERVAL 50
-#define LOOP_INTERVAL 20            // Faster sampling
-#define FALL_SPEED_THRESHOLD 0.25   // Adjusted fall threshold
+#define LOOP_INTERVAL 50          // Decreased interval for better responsiveness
+#define FALL_SPEED_THRESHOLD 0.5    // Adjusted fall threshold
 #define HEIGHT_TOLERANCE 2.5
 #define SERVO_RETRACTED_POS 0
 #define SERVO_DEPLOYED_POS 90
 #define MAX_VALID_DISTANCE 400
 #define MIN_VALID_DISTANCE 5
-#define DISTANCE_DEBOUNCE 5         // For immediate readings
-#define HISTORY_BUFFER_SIZE 10      // Extended history buffer for trend analysis
-#define CLIMBING_SPEED_THRESHOLD 0.01 // Threshold for climbing detection
-#define CONSECUTIVE_READINGS 1      // Number of consecutive readings needed to confirm fall
-#define BUTTON_DEBOUNCE_DELAY 50    // Button debounce delay in ms
+#define DISTANCE_DEBOUNCE 5         // Increased for better noise filtering
+#define CLIMBING_SPEED_THRESHOLD 0.05 // Threshold for climbing detection
+#define CONSECUTIVE_READINGS 3      // Increased to reduce false positives
+#define TOP_STAIR_ZONE 20          // Zone at top of stairs to ignore (in cm)
+#define BOTTOM_STAIR_ZONE 15         // Zone at bottom of stairs (in cm)
+
+// Fall detection reasons
+#define FALL_REASON_SPEED_DOWN 1      // Forward fall down stairs
+#define FALL_REASON_SPEED_UP 2        // Backward fall up stairs
+#define FALL_REASON_ACCELERATION 3      // Sudden acceleration
+#define FALL_REASON_NONE 0          // No fall detected
 
 // Global variables
 Servo cushionServo;
@@ -33,51 +39,50 @@ unsigned long lastMeasurementTime = 0;
 bool firstReading = true;
 bool systemStopped = false;
 bool systemHalted = false;
-
 float distanceBuffer[DISTANCE_DEBOUNCE];
-float historyBuffer[HISTORY_BUFFER_SIZE];     // Extended history buffer
-unsigned long timeBuffer[HISTORY_BUFFER_SIZE]; // Time stamps for history buffer
-int historyIndex = 0;                         // Current position in history buffer
-int historyCount = 0;                         // Number of valid entries in history buffer
-bool potentialFall = false; // Flag to indicate a potential fall
+float speedBuffer[CONSECUTIVE_READINGS];   // Buffer to track consecutive speed readings
+float accelBuffer[CONSECUTIVE_READINGS];   // Buffer to track acceleration readings
+int speedBufferIndex = 0;
+int accelBufferIndex = 0;
+int fallDetectionCount = 0;
+int fallReason = FALL_REASON_NONE;
 
 // Function prototypes
 float measureDistance();
-void deployCushion();
+void deployCushion(int reason, float speed, float acceleration, float distanceChange);
 void printTableHeader();
-void printTableRow(unsigned long time, float distance, float speed, float distChange, const char* status);
+void printTableRow(unsigned long time, float distance, float speed, float accel, float distChange, const char* status);
 float calculateSpeed(float distDiff, float timeDiff);
+float calculateAcceleration(float speedDiff, float timeDiff);
 void calibrateStairHeight();
-void processData(unsigned long currentTime, float currentDistance);
+void processData(unsigned long currentTime, float currentDistance, float speed, float accel, float distanceChange);
 void printWithPadding(String text, int width, bool rightAlign = false);
 void stopSystem();
 void resumeSystem();
 float getStableDistance();
 bool isValidDistance(float distance);
-String analyzeMovement();
-float getAverageSpeed(int samples);
-void updateHistoryBuffer(float distance, unsigned long time);
-void emergencyStop(); // Function to completely halt system in emergency
-void resetSystem();
-bool waitForButtonPress(unsigned long timeout = 0); // Function to wait for button press with timeout
-bool waitForButtonRelease(unsigned long timeout = 0); // Function to wait for button release with timeout
+int detectFallReason(float speed, float accel, float distanceChange, float currentDistance);
+String getMovementStatus(float speed, float accel, float distanceChange, float currentDistance);
+bool isAtTopOfStairs(float distance);
+bool isAtBottomOfStairs(float distance);
+String getFallReasonText(int reason, float speed, float accel, float distanceChange);
+float getPositionOnStairs(float distance);
 
 void setup() {
   Serial.begin(BAUD_RATE);
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);  // Use INPUT_PULLUP
   cushionServo.attach(SERVO_PIN);
   cushionServo.write(SERVO_RETRACTED_POS);
 
-  // Initialize buffers
   for (int i = 0; i < DISTANCE_DEBOUNCE; i++) {
     distanceBuffer[i] = 0;
   }
-
-  for (int i = 0; i < HISTORY_BUFFER_SIZE; i++) {
-    historyBuffer[i] = 0;
-    timeBuffer[i] = 0;
+  
+  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
+    speedBuffer[i] = 0;
+    accelBuffer[i] = 0;
   }
 
   Serial.println(F("\n\n**** STAIR FALL DETECTION SYSTEM ****"));
@@ -94,20 +99,13 @@ void setup() {
   printTableHeader();
   prevDistance = getStableDistance();
   prevTime = millis();
-
-  // Initialize history buffer with first valid distance
-  for (int i = 0; i < HISTORY_BUFFER_SIZE; i++) {
-    historyBuffer[i] = prevDistance;
-    timeBuffer[i] = prevTime;
-  }
-  historyCount = HISTORY_BUFFER_SIZE; // Initialize with full history
 }
 
 void loop() {
   if (systemHalted) return;
 
   // Check button status - stop system immediately if pressed
-  if (digitalRead(BUTTON_PIN) == LOW) {
+  if (digitalRead(BUTTON_PIN) == LOW) { // Check for LOW signal
     stopSystem();
     return;
   }
@@ -120,29 +118,48 @@ void loop() {
 
   float currentDistance = getStableDistance();
   if (!isValidDistance(currentDistance)) {
-    printTableRow(currentTime, currentDistance, 0, 0, "Invalid Reading");
+    printTableRow(currentTime, currentDistance, 0, 0, 0, "Invalid Reading");
     return;
   }
 
-  // Update history buffer with new measurement
-  updateHistoryBuffer(currentDistance, currentTime);
+  float timeDiff = (currentTime - prevTime) / 1000.0;
+  float distanceChange = currentDistance - prevDistance;  // Positive = moving away (down), Negative = moving closer (up)
+  
+  // Calculate speed - positive value means moving away (down stairs), negative means moving closer (up stairs)
+  float speed = calculateSpeed(distanceChange, timeDiff);
+  
+  // Calculate acceleration based on speed change
+  float prevSpeed = speedBuffer[speedBufferIndex];
+  float acceleration = calculateAcceleration(speed - prevSpeed, timeDiff);
+  
+  // Update speed buffer for consistent fall detection
+  speedBuffer[speedBufferIndex] = speed;
+  speedBufferIndex = (speedBufferIndex + 1) % CONSECUTIVE_READINGS;
+  
+  // Update acceleration buffer
+  accelBuffer[accelBufferIndex] = acceleration;
+  accelBufferIndex = (accelBufferIndex + 1) % CONSECUTIVE_READINGS;
 
-  // Process the new data point
-  processData(currentTime, currentDistance);
+  processData(currentTime, currentDistance, speed, acceleration, distanceChange);
 
   prevDistance = currentDistance;
   prevTime = currentTime;
 }
 
-void updateHistoryBuffer(float distance, unsigned long time) {
-  // Add new measurement to history buffer
-  historyIndex = (historyIndex + 1) % HISTORY_BUFFER_SIZE;
-  historyBuffer[historyIndex] = distance;
-  timeBuffer[historyIndex] = time;
+bool isAtTopOfStairs(float distance) {
+  // Check if within the top zone of stairs
+  return (distance < TOP_STAIR_ZONE);
+}
 
-  if (historyCount < HISTORY_BUFFER_SIZE) {
-    historyCount++;
-  }
+bool isAtBottomOfStairs(float distance) {
+  // Check if within the bottom zone of stairs
+  return (abs(distance - stairHeight) < BOTTOM_STAIR_ZONE);
+}
+
+float getPositionOnStairs(float distance) {
+  // Return percentage down the stairs (0% = top, 100% = bottom)
+  if (stairHeight <= 0) return 0;
+  return (distance / stairHeight) * 100.0;
 }
 
 float getStableDistance() {
@@ -153,7 +170,7 @@ float getStableDistance() {
 
   // Get new reading
   float newReading = measureDistance();
-
+  
   // If new reading is invalid but previous was valid, use previous
   if (!isValidDistance(newReading)) {
     for (int i = 1; i < DISTANCE_DEBOUNCE; i++) {
@@ -163,7 +180,7 @@ float getStableDistance() {
       }
     }
   }
-
+  
   distanceBuffer[0] = newReading;
 
   // Calculate median for better noise rejection
@@ -171,7 +188,7 @@ float getStableDistance() {
   for (int i = 0; i < DISTANCE_DEBOUNCE; i++) {
     tempBuffer[i] = distanceBuffer[i];
   }
-
+  
   // Simple bubble sort to find median
   for (int i = 0; i < DISTANCE_DEBOUNCE - 1; i++) {
     for (int j = 0; j < DISTANCE_DEBOUNCE - i - 1; j++) {
@@ -182,7 +199,7 @@ float getStableDistance() {
       }
     }
   }
-
+  
   // Return median value
   return tempBuffer[DISTANCE_DEBOUNCE / 2];
 }
@@ -230,6 +247,9 @@ void calibrateStairHeight() {
     Serial.print(F("\nCalibration complete! Average Distance: "));
     Serial.print(stairHeight);
     Serial.println(F(" cm"));
+    Serial.print(F("Top safety zone: 0-"));
+    Serial.print(TOP_STAIR_ZONE);
+    Serial.println(F(" cm (fall detection disabled)"));
   } else {
     Serial.println(F("\n!!!! CALIBRATION FAILED - NO VALID READINGS !!!!"));
     Serial.println(F("!!!! SYSTEM HALTED FOR SAFETY !!!!"));
@@ -239,110 +259,150 @@ void calibrateStairHeight() {
   Serial.println(F("------------------------------------"));
 }
 
-float getAverageSpeed(int samples) {
-  if (historyCount < 2) return 0;
-
-  // Use at most the available samples or requested samples
-  int actualSamples = min(samples, historyCount - 1);
-  if (actualSamples <= 0) return 0;
-
-  // Current index in circular buffer
-  int current = historyIndex;
-
-  // Get oldest index to use for calculation
-  int oldest = (current - actualSamples + HISTORY_BUFFER_SIZE) % HISTORY_BUFFER_SIZE;
-
-  // Calculate time and distance differences
-  float timeDiff = (timeBuffer[current] - timeBuffer[oldest]) / 1000.0; // in seconds
-  float distDiff = historyBuffer[current] - historyBuffer[oldest];     // in cm
-
-  // Avoid division by zero
-  if (timeDiff <= 0.001) return 0;
-
-  // Convert to m/s (positive = moving away = down stairs, negative = moving closer = up stairs)
-  return (distDiff / 100.0) / timeDiff;
+int detectFallReason(float speed, float accel, float distanceChange, float currentDistance) {
+  // Skip fall detection if at the top of stairs
+  if (isAtTopOfStairs(currentDistance)) {
+    return FALL_REASON_NONE;
+  }
+  
+  // Check if all readings in speed buffer exceed threshold
+  int highSpeedCount = 0;
+  
+  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
+    if (abs(speedBuffer[i]) > FALL_SPEED_THRESHOLD) {
+      highSpeedCount++;
+    }
+  }
+  
+  // Check for high acceleration
+  int highAccelCount = 0;
+  float accelThreshold = 3.0; // m/s²
+  
+  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
+    if (abs(accelBuffer[i]) > accelThreshold) {
+      highAccelCount++;
+    }
+  }
+  
+  // Must have consecutive high-speed readings
+  if (highSpeedCount >= CONSECUTIVE_READINGS - 1) {
+    // Person moving down (positive speed) and distance increasing = falling down
+    if (speed > FALL_SPEED_THRESHOLD && distanceChange > 0) {
+      return FALL_REASON_SPEED_DOWN;
+    }
+    
+    // Very fast movement upward could also be a backward fall
+    if (speed < -FALL_SPEED_THRESHOLD * 1.5) {
+      return FALL_REASON_SPEED_UP;
+    }
+  }
+  
+  // Detect sudden acceleration (regardless of direction)
+  if (highAccelCount >= CONSECUTIVE_READINGS - 1 && abs(accel) > accelThreshold) {
+    return FALL_REASON_ACCELERATION;
+  }
+  
+  return FALL_REASON_NONE;
 }
 
-String analyzeMovement() {
-  // Get speeds over different time intervals for better trend analysis
-  float shortTermSpeed = getAverageSpeed(3);   // Last ~3 readings (~60ms)
-  float mediumTermSpeed = getAverageSpeed(6);  // Last ~6 readings (~120ms)
-  float longTermSpeed = getAverageSpeed(10);   // Last ~10 readings (~200ms)
+String getFallReasonText(int reason, float speed, float accel, float distanceChange) {
+  String text = "FALL DETECTED! ";
+  
+  switch (reason) {
+    case FALL_REASON_SPEED_DOWN:
+      text += "Forward Down Stairs";
+      text += "\nReason: High downward speed (" + String(speed, 2) + " m/s)";
+      text += "\nDistance increasing by " + String(distanceChange, 1) + " cm";
+      text += "\nCriteria: Speed > " + String(FALL_SPEED_THRESHOLD, 2) + " m/s";
+      break;
+      
+    case FALL_REASON_SPEED_UP:
+      text += "Backwards Fall";
+      text += "\nReason: High upward speed (" + String(speed, 2) + " m/s)";
+      text += "\nDistance decreasing by " + String(abs(distanceChange), 1) + " cm";
+      text += "\nCriteria: Speed < -" + String(FALL_SPEED_THRESHOLD * 1.5, 2) + " m/s";
+      break;
+      
+    case FALL_REASON_ACCELERATION:
+      text += "Sudden Movement";
+      text += "\nReason: High acceleration (" + String(accel, 2) + " m/s²)";
+      text += "\nSpeed changing rapidly from " + String(speedBuffer[(accelBufferIndex-2+CONSECUTIVE_READINGS)%CONSECUTIVE_READINGS], 2);
+      text += " to " + String(speed, 2) + " m/s";
+      break;
+      
+    default:
+      text += "Unknown Reason";
+  }
+  
+  return text;
+}
 
-  // Calculate average acceleration - fix units to m/s²
-  float timeSpan = (6 * LOOP_INTERVAL / 1000.0); // Time span in seconds
-  float acceleration = timeSpan > 0.001 ? (shortTermSpeed - mediumTermSpeed) / timeSpan : 0;
-
-  // Detect different movement patterns
-
-  // Fall detection logic - look for consistent high speed down
-  if (shortTermSpeed > FALL_SPEED_THRESHOLD &&
-      mediumTermSpeed > FALL_SPEED_THRESHOLD * 0.8) {
-    return "FALL DETECTED! Down Stairs";
+String getMovementStatus(float speed, float accel, float distanceChange, float currentDistance) {
+  // Check stair position first
+  if (isAtTopOfStairs(currentDistance)) {
+    return "At Top of Stairs";
+  }
+  
+  if (isAtBottomOfStairs(currentDistance)) {
+    return "At Bottom of Stairs";
   }
 
-  // Backward fall - quick upward movement
-  if (shortTermSpeed < -FALL_SPEED_THRESHOLD * 1.2 &&
-      mediumTermSpeed < -FALL_SPEED_THRESHOLD * 0.8) {
-    return "FALL DETECTED! Backwards";
-  }
-
-  // High acceleration could indicate start of a fall (units now in m/s²)
-  if (abs(acceleration) > 3.0 && shortTermSpeed > FALL_SPEED_THRESHOLD * 0.7) {
-    return "Fall Warning";
-  }
-
-  // Regular movement classification
-  if (abs(shortTermSpeed) < CLIMBING_SPEED_THRESHOLD * 0.8 &&
-      abs(mediumTermSpeed) < CLIMBING_SPEED_THRESHOLD * 0.8) {
+  if (abs(speed) < CLIMBING_SPEED_THRESHOLD) {
     return "Stationary";
   }
-
-  // Climbing up (negative speed - getting closer to sensor)
-  if (shortTermSpeed < -CLIMBING_SPEED_THRESHOLD &&
-      mediumTermSpeed < -CLIMBING_SPEED_THRESHOLD * 0.7) {
+  
+  // Negative speed means moving towards sensor (climbing up)
+  if (speed < -CLIMBING_SPEED_THRESHOLD && distanceChange < 0) {
     return "Climbing Up";
   }
-
-  // Climbing down (positive speed - moving away from sensor)
-  if (shortTermSpeed > CLIMBING_SPEED_THRESHOLD &&
-      mediumTermSpeed > CLIMBING_SPEED_THRESHOLD * 0.7) {
+  
+  // Positive speed means moving away from sensor (climbing down)
+  if (speed > CLIMBING_SPEED_THRESHOLD && distanceChange > 0) {
+    if (speed > FALL_SPEED_THRESHOLD) {
+      // High speed downward movement
+      fallDetectionCount++;
+      if (fallDetectionCount >= 2) {
+        return "Fall Warning";  
+      }
+    }
     return "Climbing Down";
   }
-
-  return "Monitoring"; // Default status
+  
+  fallDetectionCount = 0;
+  return "Monitoring";
 }
 
-void processData(unsigned long currentTime, float currentDistance) {
+void processData(unsigned long currentTime, float currentDistance, float speed, float accel, float distanceChange) {
   if (systemStopped) return;
 
   if (firstReading) {
-    printTableRow(currentTime, currentDistance, 0, 0, "Initializing");
+    printTableRow(currentTime, currentDistance, 0, 0, 0, "Initializing");
     firstReading = false;
     return;
   }
 
   if (!isValidDistance(currentDistance)) {
-    printTableRow(currentTime, currentDistance, 0, 0, "ERROR: Invalid Value");
+    printTableRow(currentTime, currentDistance, speed, accel, distanceChange, "ERROR: Invalid Value");
     return;
   }
 
-  // Calculate most recent speed
-  float timeDiff = (currentTime - prevTime) / 1000.0;
-  float distanceChange = currentDistance - prevDistance;
-  float instantSpeed = calculateSpeed(distanceChange, timeDiff);
-
-  // Analyze movement using history buffer
-  String status = analyzeMovement();
-
-  // Check if fall was detected
-  if (status.indexOf("FALL DETECTED") >= 0) {
-    printTableRow(currentTime, currentDistance, instantSpeed, distanceChange, status.c_str());
-    emergencyStop(); // System completely pauses and deploys cushion
-    return;
+  // Get status message based on movement
+  String status = getMovementStatus(speed, accel, distanceChange, currentDistance);
+  
+  // Check for fall - but skip if at top of stairs
+  if (!isAtTopOfStairs(currentDistance)) {
+    fallReason = detectFallReason(speed, accel, distanceChange, currentDistance);
+    
+    if (fallReason != FALL_REASON_NONE) {
+      status = "FALL DETECTED!";
+      deployCushion(fallReason, speed, accel, distanceChange);
+    }
+  } else {
+    // Reset fall detection count when at top of stairs
+    fallDetectionCount = 0;
   }
 
-  printTableRow(currentTime, currentDistance, instantSpeed, distanceChange, status.c_str());
+  printTableRow(currentTime, currentDistance, speed, accel, distanceChange, status.c_str());
 }
 
 float calculateSpeed(float distDiff, float timeDiff) {
@@ -352,6 +412,11 @@ float calculateSpeed(float distDiff, float timeDiff) {
   return (timeDiff > 0.001) ? (distDiff / 100.0) / timeDiff : 0;
 }
 
+float calculateAcceleration(float speedDiff, float timeDiff) {
+  // Returns acceleration in m/s²
+  return (timeDiff > 0.001) ? speedDiff / timeDiff : 0;
+}
+
 float measureDistance() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
@@ -359,7 +424,6 @@ float measureDistance() {
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  // Set timeout to max ~4m range (24ms timeout)
   unsigned long duration = pulseIn(ECHO_PIN, HIGH, 25000);
 
   if (duration == 0) {
@@ -369,90 +433,55 @@ float measureDistance() {
   return duration * 0.034 / 2;
 }
 
-bool waitForButtonPress(unsigned long timeout) {
-  unsigned long startTime = millis();
-  
-  // Keep checking until button is pressed or timeout
-  while (digitalRead(BUTTON_PIN) == HIGH) {
-    // Check for timeout if specified
-    if (timeout > 0 && (millis() - startTime > timeout)) {
-      return false; // Timeout occurred, button not pressed
-    }
-    delay(BUTTON_DEBOUNCE_DELAY);
-  }
-  
-  // Button pressed, debounce
-  delay(BUTTON_DEBOUNCE_DELAY);
-  return true;
-}
-
-bool waitForButtonRelease(unsigned long timeout) {
-  unsigned long startTime = millis();
-  
-  // Keep checking until button is released or timeout
-  while (digitalRead(BUTTON_PIN) == LOW) {
-    // Check for timeout if specified
-    if (timeout > 0 && (millis() - startTime > timeout)) {
-      return false; // Timeout occurred, button not released
-    }
-    delay(BUTTON_DEBOUNCE_DELAY);
-  }
-  
-  // Button released, debounce
-  delay(BUTTON_DEBOUNCE_DELAY);
-  return true;
-}
-
-void emergencyStop() {
-  // Complete system pause and deploy cushion
-  systemStopped = true; // Stop system operation
-  
-  // Check if the button is pressed before deploying the cushion
-  if (digitalRead(BUTTON_PIN) == HIGH) { // Only deploy if button is not pressed
-    deployCushion();
-  }
-
-  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!  EMERGENCY STOP ACTIVATED !!!!"));
-  if (cushionDeployed) {
-    Serial.println(F("!!!!  CUSHION DEPLOYED         !!!!"));
-  }
-  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"));
-  Serial.println(F("Press button to reset system"));
-
-  // Wait for button press to reset
-  delay(1000); // Allow time to read message
-
-  // Fixed button handling logic with timeout
-  if (waitForButtonPress(0) && waitForButtonRelease(5000)) {
-    // Reset system only if button was properly pressed and released
-    resetSystem();
-  } else {
-    Serial.println(F("\n!!! Button timeout or error, system still stopped !!!"));
-    Serial.println(F("Press button again to retry reset"));
-  }
-}
-
-void deployCushion() {
+void deployCushion(int reason, float speed, float acceleration, float distanceChange) {
   if (cushionDeployed) return;
 
-  cushionServo.write(SERVO_DEPLOYED_POS); // Servo turns exactly 90 degrees
+  cushionServo.write(SERVO_DEPLOYED_POS);
   cushionDeployed = true;
 
+  String reasonText = getFallReasonText(reason, speed, acceleration, distanceChange);
+
   Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!     CUSHION DEPLOYED     !!!!"));
-  Serial.println(F("!!!!     SERVO AT 90 DEGREES  !!!!"));  // Servo position notification
+  Serial.println(F("!!!!          CUSHION DEPLOYED          !!!!"));
   Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"));
+  
+  Serial.println(reasonText);
+  Serial.println(F("\n----- Fall Detection Details -----"));
+  Serial.print(F("Position on stairs: "));
+  
+  float positionPct = getPositionOnStairs(prevDistance);
+  Serial.print(positionPct, 1);
+  Serial.println(F("% down the staircase"));
+  
+  Serial.println(F("\nSpeed readings history (m/s):"));
+  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
+    int idx = (speedBufferIndex - 1 - i + CONSECUTIVE_READINGS) % CONSECUTIVE_READINGS;
+    Serial.print(F("  Reading -"));
+    Serial.print(i+1);
+    Serial.print(F(": "));
+    Serial.println(speedBuffer[idx], 2);
+  }
+  
+  Serial.println(F("\nAcceleration readings history (m/s²):"));
+  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
+    int idx = (accelBufferIndex - 1 - i + CONSECUTIVE_READINGS) % CONSECUTIVE_READINGS;
+    Serial.print(F("  Reading -"));
+    Serial.print(i+1);
+    Serial.print(F(": "));
+    Serial.println(accelBuffer[idx], 2);
+  }
+  
+  Serial.println(F("\n---------------------------------"));
 }
 
 void printTableHeader() {
-  Serial.println(F("+------------+-----------+-----------+------------+----------------------+"));
-  Serial.println(F("|     Time     | Distance  |   Speed   |  Distance  |        Status          |"));
-  Serial.println(F("|     (ms)     |   (cm)    |   (m/s)   |   Change   |                        |"));
-  Serial.println(F("+------------+-----------+-----------+------------+----------------------+"));
+  Serial.println(F("+------------+-----------+-----------+-----------+------------+----------------------+"));
+  Serial.println(F("|     Time     | Distance  |   Speed     |   Accel.    |  Distance   |         Status                 |"));
+  Serial.println(F("|     (ms)     |    (cm)    |    (m/s)    |   (m/s²)    |    Change    |                                  |"));
+  Serial.println(F("+------------+-----------+-----------+-----------+------------+----------------------+"));
 }
 
-void printTableRow(unsigned long time, float distance, float speed, float distChange, const char* status) {
+void printTableRow(unsigned long time, float distance, float speed, float accel, float distChange, const char* status) {
   Serial.print(F("| "));
   printWithPadding(String(time), 10, true);
   Serial.print(F(" | "));
@@ -463,6 +492,10 @@ void printTableRow(unsigned long time, float distance, float speed, float distCh
   Serial.print(F(" | "));
 
   dtostrf(speed, 5, 2, buffer);
+  printWithPadding(buffer, 9);
+  Serial.print(F(" | "));
+
+  dtostrf(accel, 5, 2, buffer);
   printWithPadding(buffer, 9);
   Serial.print(F(" | "));
 
@@ -491,53 +524,45 @@ void stopSystem() {
   systemStopped = true;
 
   Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!        SYSTEM STOPPED      !!!!"));
+  Serial.println(F("!!!!          SYSTEM STOPPED          !!!!"));
   Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
   Serial.println(F("Press the button again to resume...\n"));
 
-  // Fixed button handling with better debouncing
-  if (waitForButtonRelease(3000) && waitForButtonPress(0) && waitForButtonRelease(3000)) {
-    resumeSystem();
-  } else {
-    Serial.println(F("\n!!! Button timeout or error, system still stopped !!!"));
-    Serial.println(F("Press button again to retry resuming"));
+  // Wait for button to be released first
+  while (digitalRead(BUTTON_PIN) == LOW) {
+    delay(50);
   }
-}
+  
+  // Wait for next button press to resume
+  while (digitalRead(BUTTON_PIN) == HIGH) {
+    delay(50);
+  }
+  
+  // Wait for button release
+  while (digitalRead(BUTTON_PIN) == LOW) {
+    delay(50);
+  }
 
-void resetSystem() {
-  // Reset the system after emergency stop
-  systemStopped = false;
-  cushionDeployed = false;
-  cushionServo.write(SERVO_RETRACTED_POS);
-
-  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!        SYSTEM RESET        !!!!"));
-  Serial.println(F("!!!!    CUSHION RETRACTED      !!!!"));
-  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"));
-
-  delay(500);
   resumeSystem();
 }
 
 void resumeSystem() {
   systemStopped = false;
+  fallDetectionCount = 0;  // Reset fall detection counter
+  fallReason = FALL_REASON_NONE;
+  
+  // Reset speed and acceleration buffers
+  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
+    speedBuffer[i] = 0;
+    accelBuffer[i] = 0;
+  }
+  
+  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
+  Serial.println(F("!!!!          SYSTEM RESUMED          !!!!"));
+  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
 
-  // Reset history calculations
   lastMeasurementTime = millis();
   prevTime = millis();
   prevDistance = getStableDistance();
-
-  // Reset history buffer with current distance
-  for (int i = 0; i < HISTORY_BUFFER_SIZE; i++) {
-    historyBuffer[i] = prevDistance;
-    timeBuffer[i] = prevTime;
-  }
-  historyCount = HISTORY_BUFFER_SIZE; // Set to full buffer
-  historyIndex = 0;
-
-  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!         SYSTEM RESUMED      !!!!"));
-  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"));
-
   printTableHeader();
 }
