@@ -1,0 +1,60 @@
+// LED pins (make sure they are PWM capable)
+const int ledPin1 = 2;
+const int ledPin2 = 3;
+const int ledPin3 = 4;
+
+const int sequenceDelay = 200;  // Delay between each LED activation
+const int fadeDelay = 10;       // Delay between each fade step
+const int stayOnTime = 3000;    // Duration all LEDs stay fully on
+
+const int triggerPin = 7;
+
+void setup() {
+  pinMode(ledPin1, OUTPUT);
+  pinMode(ledPin2, OUTPUT);
+  pinMode(ledPin3, OUTPUT);
+  pinMode(triggerPin, INPUT_PULLUP);
+  Serial.begin(9600);
+  Serial.println("LED Fade Sequence Ready");
+}
+
+void fadeIn(int pin) {
+  for (int brightness = 0; brightness <= 255; brightness += 5) {
+    analogWrite(pin, brightness);
+    delay(fadeDelay);
+  }
+}
+
+void fadeOut(int pin) {
+  for (int brightness = 255; brightness >= 0; brightness -= 5) {
+    analogWrite(pin, brightness);
+    delay(fadeDelay);
+  }
+}
+
+void loop() {
+  if (digitalRead(triggerPin) == LOW) {
+    Serial.println("Trigger detected! Starting fade sequence");
+
+    fadeIn(ledPin1);
+    delay(sequenceDelay);
+
+    fadeIn(ledPin2);
+    delay(sequenceDelay);
+
+    fadeIn(ledPin3);
+
+    delay(stayOnTime); // Keep them all on
+
+    // Fade out in reverse order
+    fadeOut(ledPin3);
+    delay(sequenceDelay);
+
+    fadeOut(ledPin2);
+    delay(sequenceDelay);
+
+    fadeOut(ledPin1);
+    
+    delay(500); // Debounce delay
+  }
+}
