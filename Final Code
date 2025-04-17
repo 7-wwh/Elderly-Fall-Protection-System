@@ -4,7 +4,7 @@
 #define TRIG_PIN 9
 #define ECHO_PIN 10
 #define SERVO1_PIN 6      
-#define SERVO2_PIN 5      
+#define SERVO2_PIN 13      
 #define BUTTON_PIN 7
 
 // Configuration parameters
