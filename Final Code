@@ -3,36 +3,38 @@
 // Pin definitions
 #define TRIG_PIN 9
 #define ECHO_PIN 10
-#define SERVO_PIN 6
+#define SERVO1_PIN 6      
+#define SERVO2_PIN 5      
 #define BUTTON_PIN 7
 
 // Configuration parameters
 #define BAUD_RATE 9600
 #define CALIBRATION_TIME 5000
 #define CALIBRATION_INTERVAL 50
-#define LOOP_INTERVAL 50          // Decreased interval for better responsiveness
-#define FALL_SPEED_THRESHOLD 0.5    // Adjusted fall threshold
+#define LOOP_INTERVAL 50
+#define FALL_SPEED_THRESHOLD 0.5
 #define HEIGHT_TOLERANCE 2.5
 #define SERVO_RETRACTED_POS 0
 #define SERVO_DEPLOYED_POS 90
 #define MAX_VALID_DISTANCE 400
 #define MIN_VALID_DISTANCE 5
-#define DISTANCE_DEBOUNCE 5         // Increased for better noise filtering
-#define CLIMBING_SPEED_THRESHOLD 0.05 // Threshold for climbing detection
-#define CONSECUTIVE_READINGS 3      // Increased to reduce false positives
-#define TOP_STAIR_ZONE 5          // Zone at top of stairs to ignore (in cm)
-#define BOTTOM_STAIR_ZONE 5         // Zone at bottom of stairs (in cm)
-#define SUDDEN_DROP_THRESHOLD 10  // If distance drops by this much, consider it a fall (in cm)
+#define DISTANCE_DEBOUNCE 5
+#define CLIMBING_SPEED_THRESHOLD 0.05
+#define CONSECUTIVE_READINGS 3
+#define TOP_STAIR_ZONE 20
+#define BOTTOM_STAIR_ZONE 15
+#define SUDDEN_DROP_THRESHOLD 30
 
 // Fall detection reasons
-#define FALL_REASON_SPEED_DOWN 1      // Forward fall down stairs
-#define FALL_REASON_SPEED_UP 2        // Backward fall up stairs
-#define FALL_REASON_ACCELERATION 3      // Sudden acceleration
-#define FALL_REASON_SUDDEN_DROP 4    // Sudden drop in distance
-#define FALL_REASON_NONE 0          // No fall detected
+#define FALL_REASON_SPEED_DOWN 1
+#define FALL_REASON_SPEED_UP 2
+#define FALL_REASON_ACCELERATION 3
+#define FALL_REASON_SUDDEN_DROP 4
+#define FALL_REASON_NONE 0
 
 // Global variables
-Servo cushionServo;
+Servo cushionServo1;    // Renamed to cushionServo1
+Servo cushionServo2;    // Added for the second servo
 float stairHeight = 0;
 float prevDistance = 0;
 unsigned long prevTime = 0;
@@ -42,12 +44,13 @@ bool firstReading = true;
 bool systemStopped = false;
 bool systemHalted = false;
 float distanceBuffer[DISTANCE_DEBOUNCE];
-float speedBuffer[CONSECUTIVE_READINGS];   // Buffer to track consecutive speed readings
-float accelBuffer[CONSECUTIVE_READINGS];   // Buffer to track acceleration readings
+float speedBuffer[CONSECUTIVE_READINGS];
+float accelBuffer[CONSECUTIVE_READINGS];
 int speedBufferIndex = 0;
 int accelBufferIndex = 0;
 int fallDetectionCount = 0;
 int fallReason = FALL_REASON_NONE;
+bool resumeInProgress = false;  // Add this flag to track if a resume is in progress
 
 // Function prototypes
 float measureDistance();
@@ -74,9 +77,13 @@ void setup() {
   Serial.begin(BAUD_RATE);
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);  // Use INPUT_PULLUP
-  cushionServo.attach(SERVO_PIN);
-  cushionServo.write(SERVO_RETRACTED_POS);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  cushionServo1.attach(SERVO1_PIN);
+  cushionServo2.attach(SERVO2_PIN);
+  
+  // Set both servos to retracted position
+  cushionServo1.write(SERVO_RETRACTED_POS);
+  cushionServo2.write(SERVO_RETRACTED_POS);
 
   for (int i = 0; i < DISTANCE_DEBOUNCE; i++) {
     distanceBuffer[i] = 0;
@@ -107,7 +114,7 @@ void loop() {
   if (systemHalted) return;
 
   // Check button status - stop system immediately if pressed
-  if (digitalRead(BUTTON_PIN) == LOW) { // Check for LOW signal
+  if (digitalRead(BUTTON_PIN) == LOW) {
     stopSystem();
     return;
   }
@@ -125,20 +132,16 @@ void loop() {
   }
 
   float timeDiff = (currentTime - prevTime) / 1000.0;
-  float distanceChange = currentDistance - prevDistance;  // Positive = moving away (down), Negative = moving closer (up)
+  float distanceChange = currentDistance - prevDistance;
   
-  // Calculate speed - positive value means moving away (down stairs), negative means moving closer (up stairs)
   float speed = calculateSpeed(distanceChange, timeDiff);
   
-  // Calculate acceleration based on speed change
   float prevSpeed = speedBuffer[speedBufferIndex];
   float acceleration = calculateAcceleration(speed - prevSpeed, timeDiff);
   
-  // Update speed buffer for consistent fall detection
   speedBuffer[speedBufferIndex] = speed;
   speedBufferIndex = (speedBufferIndex + 1) % CONSECUTIVE_READINGS;
   
-  // Update acceleration buffer
   accelBuffer[accelBufferIndex] = acceleration;
   accelBufferIndex = (accelBufferIndex + 1) % CONSECUTIVE_READINGS;
 
@@ -149,31 +152,25 @@ void loop() {
 }
 
 bool isAtTopOfStairs(float distance) {
-  // Check if within the top zone of stairs
   return (distance < TOP_STAIR_ZONE);
 }
 
 bool isAtBottomOfStairs(float distance) {
-  // Check if within the bottom zone of stairs
   return (abs(distance - stairHeight) < BOTTOM_STAIR_ZONE);
 }
 
 float getPositionOnStairs(float distance) {
-  // Return percentage down the stairs (0% = top, 100% = bottom)
   if (stairHeight <= 0) return 0;
   return (distance / stairHeight) * 100.0;
 }
 
 float getStableDistance() {
-  // Shift buffer values
   for (int i = DISTANCE_DEBOUNCE - 1; i > 0; i--) {
     distanceBuffer[i] = distanceBuffer[i - 1];
   }
 
-  // Get new reading
   float newReading = measureDistance();
   
-  // If new reading is invalid but previous was valid, use previous
   if (!isValidDistance(newReading)) {
     for (int i = 1; i < DISTANCE_DEBOUNCE; i++) {
       if (isValidDistance(distanceBuffer[i])) {
@@ -185,13 +182,11 @@ float getStableDistance() {
   
   distanceBuffer[0] = newReading;
 
-  // Calculate median for better noise rejection
   float tempBuffer[DISTANCE_DEBOUNCE];
   for (int i = 0; i < DISTANCE_DEBOUNCE; i++) {
     tempBuffer[i] = distanceBuffer[i];
   }
   
-  // Simple bubble sort to find median
   for (int i = 0; i < DISTANCE_DEBOUNCE - 1; i++) {
     for (int j = 0; j < DISTANCE_DEBOUNCE - i - 1; j++) {
       if (tempBuffer[j] > tempBuffer[j + 1]) {
@@ -202,7 +197,6 @@ float getStableDistance() {
     }
   }
   
-  // Return median value
   return tempBuffer[DISTANCE_DEBOUNCE / 2];
 }
 
@@ -262,12 +256,15 @@ void calibrateStairHeight() {
 }
 
 int detectFallReason(float speed, float accel, float distanceChange, float currentDistance) {
-  // Skip fall detection if at the top of stairs
+  // If we just resumed, don't detect falls immediately to prevent false positives
+  if (resumeInProgress) {
+    return FALL_REASON_NONE;
+  }
+  
   if (isAtTopOfStairs(currentDistance)) {
     return FALL_REASON_NONE;
   }
   
-  // Check if all readings in speed buffer exceed threshold
   int highSpeedCount = 0;
   
   for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
@@ -276,9 +273,8 @@ int detectFallReason(float speed, float accel, float distanceChange, float curre
     }
   }
   
-  // Check for high acceleration
   int highAccelCount = 0;
-  float accelThreshold = 3.0; // m/s²
+  float accelThreshold = 3.0;
   
   for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
     if (abs(accelBuffer[i]) > accelThreshold) {
@@ -286,25 +282,20 @@ int detectFallReason(float speed, float accel, float distanceChange, float curre
     }
   }
   
-  // Must have consecutive high-speed readings
   if (highSpeedCount >= CONSECUTIVE_READINGS - 1) {
-    // Person moving down (positive speed) and distance increasing = falling down
     if (speed > FALL_SPEED_THRESHOLD && distanceChange > 0) {
       return FALL_REASON_SPEED_DOWN;
     }
     
-    // Very fast movement upward could also be a backward fall
     if (speed < -FALL_SPEED_THRESHOLD * 1.5) {
       return FALL_REASON_SPEED_UP;
     }
   }
   
-  // Detect sudden acceleration (regardless of direction)
   if (highAccelCount >= CONSECUTIVE_READINGS - 1 && abs(accel) > accelThreshold) {
     return FALL_REASON_ACCELERATION;
   }
   
-  // Check for sudden drop back to bottom
   if (!isAtBottomOfStairs(prevDistance) && isAtBottomOfStairs(currentDistance) && distanceChange > SUDDEN_DROP_THRESHOLD) {
     return FALL_REASON_SUDDEN_DROP;
   }
@@ -351,7 +342,6 @@ String getFallReasonText(int reason, float speed, float accel, float distanceCha
 }
 
 String getMovementStatus(float speed, float accel, float distanceChange, float currentDistance) {
-  // Check stair position first
   if (isAtTopOfStairs(currentDistance)) {
     return "At Top of Stairs";
   }
@@ -364,18 +354,15 @@ String getMovementStatus(float speed, float accel, float distanceChange, float c
     return "Stationary";
   }
   
-  // Negative speed means moving towards sensor (climbing up)
   if (speed < -CLIMBING_SPEED_THRESHOLD && distanceChange < 0) {
     return "Climbing Up";
   }
   
-  // Positive speed means moving away from sensor (climbing down)
   if (speed > CLIMBING_SPEED_THRESHOLD && distanceChange > 0) {
     if (speed > FALL_SPEED_THRESHOLD) {
-      // High speed downward movement
       fallDetectionCount++;
       if (fallDetectionCount >= 2) {
-        return "Fall Warning";  
+        return "Fall Warning";
       }
     }
     return "Climbing Down";
@@ -399,11 +386,20 @@ void processData(unsigned long currentTime, float currentDistance, float speed, 
     return;
   }
 
-  // Get status message based on movement
   String status = getMovementStatus(speed, accel, distanceChange, currentDistance);
   
-  // Check for fall - but skip if at top of stairs
-  if (!isAtTopOfStairs(currentDistance)) {
+  // Clear the resumeInProgress flag after a few valid readings
+  if (resumeInProgress) {
+    static int validReadingsAfterResume = 0;
+    validReadingsAfterResume++;
+    if (validReadingsAfterResume >= CONSECUTIVE_READINGS) {
+      resumeInProgress = false;
+      validReadingsAfterResume = 0;
+      status = "Resume Complete";
+    } else {
+      status = "Resuming...";
+    }
+  } else if (!isAtTopOfStairs(currentDistance)) {
     fallReason = detectFallReason(speed, accel, distanceChange, currentDistance);
     
     if (fallReason != FALL_REASON_NONE) {
@@ -411,7 +407,6 @@ void processData(unsigned long currentTime, float currentDistance, float speed, 
       deployCushion(fallReason, speed, accel, distanceChange);
     }
   } else {
-    // Reset fall detection count when at top of stairs
     fallDetectionCount = 0;
   }
 
@@ -419,14 +414,10 @@ void processData(unsigned long currentTime, float currentDistance, float speed, 
 }
 
 float calculateSpeed(float distDiff, float timeDiff) {
-  // Returns speed in m/s
-  // Positive speed = moving away (down stairs)
-  // Negative speed = moving closer (up stairs)
   return (timeDiff > 0.001) ? (distDiff / 100.0) / timeDiff : 0;
 }
 
 float calculateAcceleration(float speedDiff, float timeDiff) {
-  // Returns acceleration in m/s²
   return (timeDiff > 0.001) ? speedDiff / timeDiff : 0;
 }
 
@@ -447,9 +438,11 @@ float measureDistance() {
 }
 
 void deployCushion(int reason, float speed, float acceleration, float distanceChange) {
-  if (cushionDeployed) return;
+  if (cushionDeployed || resumeInProgress) return;  // Don't deploy if we're resuming
 
-  cushionServo.write(SERVO_DEPLOYED_POS);
+  // Deploy both servos
+  cushionServo1.write(SERVO_DEPLOYED_POS);  // 90 degrees
+  cushionServo2.write(SERVO_DEPLOYED_POS);  // 90 degrees
   cushionDeployed = true;
 
   String reasonText = getFallReasonText(reason, speed, acceleration, distanceChange);
@@ -535,6 +528,10 @@ void printWithPadding(String text, int width, bool rightAlign) {
 
 void stopSystem() {
   systemStopped = true;
+  
+  // Deploy both servos when button is pressed
+  cushionServo1.write(SERVO_DEPLOYED_POS);  // 90 degrees
+  cushionServo2.write(SERVO_DEPLOYED_POS);  // 90 degrees
 
   Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
   Serial.println(F("!!!!          SYSTEM STOPPED          !!!!"));
@@ -561,10 +558,11 @@ void stopSystem() {
 
 void resumeSystem() {
   systemStopped = false;
-  fallDetectionCount = 0;  // Reset fall detection counter
+  cushionDeployed = false;  // Reset the cushion deployed flag
+  fallDetectionCount = 0;
   fallReason = FALL_REASON_NONE;
+  resumeInProgress = true;  // Set the resume flag to prevent immediate deployment
   
-  // Reset speed and acceleration buffers
   for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
     speedBuffer[i] = 0;
     accelBuffer[i] = 0;
@@ -573,6 +571,11 @@ void resumeSystem() {
   Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
   Serial.println(F("!!!!          SYSTEM RESUMED          !!!!"));
   Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
+  Serial.println(F("Stabilizing readings..."));
+
+  // Retract both servos when resuming
+  cushionServo1.write(SERVO_RETRACTED_POS);  // 0 degrees
+  cushionServo2.write(SERVO_RETRACTED_POS);  // 0 degrees
 
   lastMeasurementTime = millis();
   prevTime = millis();
