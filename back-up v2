@@ -1,44 +1,36 @@
 #include <Servo.h>
-#include <Adafruit_NeoPixel.h>
+#include <Adafruit_NeoPixel.h> // Include the NeoPixel library
 
 // Pin definitions
 #define TRIG_PIN 9
 #define ECHO_PIN 10
-#define SERVO1_PIN 6      
-#define SERVO2_PIN 5      
-#define BUTTON_PIN 7
-#define LED_PIN 11
-#define NUM_LEDS 8
-#define BRIGHTNESS 10
-
-// Stair lighting pins
-#define STAIR_LED_1 2
-#define STAIR_LED_2 3
-#define STAIR_LED_3 4
-#define STAIR_LED_4 5
-#define NUM_STAIR_LEDS 4
+#define SERVO1_PIN 6      // Servo 1 pin (PWM capable ~)
+// #define SERVO2_PIN 5   // Pin 5 is now used for a light, removing Servo 2
+#define BUTTON_PIN 7      // Button to stop/resume system
+#define PIN5_LIGHT_PIN 5  // Light indicating if NOT at bottom OR system stopped
+#define EMERGENCY_LIGHT_PIN 8 // Data pin for the NeoPixel
 
 // Configuration parameters
 #define BAUD_RATE 9600
 #define CALIBRATION_TIME 5000
 #define CALIBRATION_INTERVAL 50
 #define LOOP_INTERVAL 50
-#define FALL_SPEED_THRESHOLD 0.5
-#define HEIGHT_TOLERANCE 2.5
+#define FALL_SPEED_THRESHOLD 0.5 // m/s
+#define HEIGHT_TOLERANCE 2.5     // cm
 #define SERVO_RETRACTED_POS 0
 #define SERVO_DEPLOYED_POS 90
-#define MAX_VALID_DISTANCE 400
-#define MIN_VALID_DISTANCE 5
-#define DISTANCE_DEBOUNCE 5
-#define CLIMBING_SPEED_THRESHOLD 0.05
-#define CONSECUTIVE_READINGS 3
-#define TOP_STAIR_ZONE 5
-#define BOTTOM_STAIR_ZONE 5
-#define SUDDEN_DROP_THRESHOLD 30
-#define STAIR_LIGHT_DURATION 3000  // Duration each stair light stays on (ms)
-#define STAIR_FADE_DELAY 10        // Delay between fade steps (ms)
-#define STAIR_FADE_STEPS 50        // Number of steps for fading (lower for faster fade)
-#define STAIR_SEQUENCE_DELAY 200   // Delay between turning on consecutive lights
+#define MAX_VALID_DISTANCE 400   // cm
+#define MIN_VALID_DISTANCE 5     // cm
+#define DISTANCE_DEBOUNCE 5      // Number of readings for median filter
+#define CLIMBING_SPEED_THRESHOLD 0.05 // m/s - Minimal speed considered as movement
+#define CONSECUTIVE_READINGS 3   // Readings buffer size for speed/accel/fall detection
+#define TOP_STAIR_ZONE 5         // cm - Distance from top considered 'at top'
+#define BOTTOM_STAIR_ZONE 5      // cm - Distance from bottom considered 'at bottom'
+#define SUDDEN_DROP_THRESHOLD 30 // cm - Threshold for sudden drop detection
+
+// NeoPixel Configuration
+#define NUM_LEDS 1       // Number of NeoPixels in the strip
+
 
 // Fall detection reasons
 #define FALL_REASON_SPEED_DOWN 1
@@ -48,38 +40,28 @@
 #define FALL_REASON_NONE 0
 
 // Global variables
-Servo cushionServo1;
-Servo cushionServo2;
-Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+Servo cushionServo1; // Only one servo now
+// Servo cushionServo2; // Removed
+
 float stairHeight = 0;
 float prevDistance = 0;
 unsigned long prevTime = 0;
 bool cushionDeployed = false;
 unsigned long lastMeasurementTime = 0;
 bool firstReading = true;
-bool systemStopped = false;
-bool systemHalted = false;
+bool systemStopped = false; // Flag: True if stopped by button
+bool systemHalted = false;  // Flag: True if calibration failed (permanent halt)
 float distanceBuffer[DISTANCE_DEBOUNCE];
 float speedBuffer[CONSECUTIVE_READINGS];
 float accelBuffer[CONSECUTIVE_READINGS];
 int speedBufferIndex = 0;
 int accelBufferIndex = 0;
-int fallDetectionCount = 0;
+int fallDetectionCount = 0; // Counter for consecutive fall warnings (e.g., fast descent)
 int fallReason = FALL_REASON_NONE;
 bool resumeInProgress = false;  // Flag to track if a resume is in progress
-bool emergencyLightsOn = false;
 
-// Stair lighting variables
-int stairLedPins[NUM_STAIR_LEDS] = {STAIR_LED_1, STAIR_LED_2, STAIR_LED_3, STAIR_LED_4};
-unsigned long stairLightTimers[NUM_STAIR_LEDS] = {0, 0, 0, 0};
-bool stairLightsActive[NUM_STAIR_LEDS] = {false, false, false, false};
-int stairLightBrightness[NUM_STAIR_LEDS] = {0, 0, 0, 0};
-bool stairLightFading[NUM_STAIR_LEDS] = {false, false, false, false};
-bool climbingUp = false;
-bool climbingDown = false;
-unsigned long lastClimbingDetectionTime = 0;
-int currentStairLightIndex = 0;
-bool fallLightsActive = false;  // Flag to keep lights on during fall detection
+// --- NeoPixel Variable ---
+Adafruit_NeoPixel emergencyLight = Adafruit_NeoPixel(NUM_LEDS, EMERGENCY_LIGHT_PIN);
 
 // Function prototypes
 float measureDistance();
@@ -101,319 +83,309 @@ bool isAtTopOfStairs(float distance);
 bool isAtBottomOfStairs(float distance);
 String getFallReasonText(int reason, float speed, float accel, float distanceChange);
 float getPositionOnStairs(float distance);
-void turnOnEmergencyLights();
-void turnOffEmergencyLights();
-void initializeStairLights();
-void turnOffAllStairLights();
-void updateStairLightSequence();
-void triggerUpwardLightSequence();
-void triggerDownwardLightSequence();
-void updateStairLightStatus();
-void fadeInStairLight(int index);
-void fadeOutStairLight(int index);
-void updateFadingStairLights();
-void keepStairLightsOnForFall();
+// --- NeoPixel Function Prototypes ---
+void setEmergencyLightColor(uint32_t color);
 
 void setup() {
   Serial.begin(BAUD_RATE);
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  cushionServo1.attach(SERVO1_PIN);
-  cushionServo2.attach(SERVO2_PIN);
-  
-  // Initialize stair LED pins
-  initializeStairLights();
-  
-  // Initialize LED strip
-  strip.begin();
-  strip.setBrightness(BRIGHTNESS);
-  turnOffEmergencyLights();  // Ensure lights are off at startup
-  
-  // Set both servos to retracted position
-  cushionServo1.write(SERVO_RETRACTED_POS);
-  cushionServo2.write(SERVO_RETRACTED_POS);
+  pinMode(PIN5_LIGHT_PIN, OUTPUT);      // Initialize Pin 5 light output
 
+  cushionServo1.attach(SERVO1_PIN);
+  // cushionServo2.attach(SERVO2_PIN); // Removed
+
+  // Initialize lights
+  digitalWrite(PIN5_LIGHT_PIN, LOW); // Ensure standard light is off
+  emergencyLight.begin();           // Initialize the NeoPixel
+  emergencyLight.show();            // Turn off all pixels in case they are on
+
+  // Set servo 1 to retracted position
+  cushionServo1.write(SERVO_RETRACTED_POS);
+  // cushionServo2.write(SERVO_RETRACTED_POS); // Removed
+
+  // Initialize buffers
   for (int i = 0; i < DISTANCE_DEBOUNCE; i++) {
     distanceBuffer[i] = 0;
   }
-  
   for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
     speedBuffer[i] = 0;
     accelBuffer[i] = 0;
   }
 
-  Serial.println(F("\n\n**** STAIR FALL DETECTION SYSTEM ****"));
-  Serial.println(F("------------------------------------"));
+  Serial.println(F("\n\n**** STAIR FALL DETECTION SYSTEM (NeoPixel) ****"));
+  Serial.println(F("-----------------------------------------------------"));
   delay(100);
 
   calibrateStairHeight();
 
   if (systemHalted) {
     Serial.println(F("\nSYSTEM HALTED: Calibration failed."));
+    // Optionally blink a light or take other action on halt
     return;
   }
 
   printTableHeader();
-  prevDistance = getStableDistance();
+  prevDistance = getStableDistance(); // Get initial distance
   prevTime = millis();
+  firstReading = true; // Ensure initialization message is printed
 }
 
 void loop() {
-  if (systemHalted) return;
+  if (systemHalted) return; // Stop if calibration failed
 
   // Check button status - stop system immediately if pressed
-  if (digitalRead(BUTTON_PIN) == LOW) {
-    stopSystem();
-    return;
+  // Use a simple debounce check
+  static unsigned long lastButtonPressTime = 0;
+  static bool lastButtonState = HIGH;
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+  if (currentButtonState != lastButtonState) {
+      lastButtonPressTime = millis();
   }
+  if ((millis() - lastButtonPressTime > 50)) { // 50ms debounce delay
+      if (currentButtonState == LOW && lastButtonState == HIGH) { // Button pressed edge
+          stopSystem();
+          // stopSystem() handles the loop until resumed, so we return here
+          lastButtonState = currentButtonState; // Update state after handling press
+          return;
+      }
+  }
+  lastButtonState = currentButtonState; // Update state for next iteration
 
-  if (cushionDeployed || systemStopped) return;
+
+  // If system is stopped by button or cushion is deployed, do nothing further in loop
+  if (systemStopped || cushionDeployed) return;
 
   unsigned long currentTime = millis();
-  
-  // Update stair lights status based on timers and handle fading
-  updateStairLightStatus();
-  updateFadingStairLights();
-  
+
+  // Only measure and process data at defined intervals
   if (currentTime - lastMeasurementTime < LOOP_INTERVAL) return;
   lastMeasurementTime = currentTime;
 
+  // Get stable distance reading
   float currentDistance = getStableDistance();
+
+  // Validate distance before calculating speed/accel
   if (!isValidDistance(currentDistance)) {
-    printTableRow(currentTime, currentDistance, 0, 0, 0, "Invalid Reading");
+    processData(currentTime, currentDistance, 0, 0, 0); // Process invalid reading state
+    // Don't update prevDistance if current reading is invalid
+    prevTime = currentTime; // Still update time
     return;
   }
 
+  // Calculate time difference since last valid reading
   float timeDiff = (currentTime - prevTime) / 1000.0;
+
+  // Calculate distance change, speed, and acceleration
   float distanceChange = currentDistance - prevDistance;
-  
   float speed = calculateSpeed(distanceChange, timeDiff);
-  
-  float prevSpeed = speedBuffer[speedBufferIndex];
+  float prevSpeed = speedBuffer[speedBufferIndex]; // Get previous speed from buffer
   float acceleration = calculateAcceleration(speed - prevSpeed, timeDiff);
-  
+
+  // Update speed and acceleration buffers (circular buffer)
   speedBuffer[speedBufferIndex] = speed;
   speedBufferIndex = (speedBufferIndex + 1) % CONSECUTIVE_READINGS;
-  
   accelBuffer[accelBufferIndex] = acceleration;
   accelBufferIndex = (accelBufferIndex + 1) % CONSECUTIVE_READINGS;
 
+  // Process the collected data (includes fall detection and status printing)
   processData(currentTime, currentDistance, speed, acceleration, distanceChange);
 
+  // Update previous values for the next loop iteration
   prevDistance = currentDistance;
   prevTime = currentTime;
 }
 
-// LED control functions
-void turnOnEmergencyLights() {
-  if (!emergencyLightsOn) {
-    for(int i = 0; i < NUM_LEDS; i++) {
-      strip.setPixelColor(i, strip.Color(255, 255, 255));  // Set to white (RGB: 255,255,255)
-    }
-    strip.show();
-    emergencyLightsOn = true;
-    Serial.println(F("Emergency lights activated"));
+// --- Simplified Light Control (No dedicated functions needed) ---
+// Logic is integrated into stopSystem, resumeSystem, and processData
+
+void stopSystem() {
+  if (systemStopped) return; // Prevent re-entry if already stopped
+
+  systemStopped = true;
+  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
+  Serial.println(F("!!!!         SYSTEM STOPPED         !!!!"));
+  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
+
+  // Deploy cushion servo 1
+  cushionServo1.write(SERVO_DEPLOYED_POS);
+  Serial.println(F("Cushion Servo 1 Deployed (Manual Stop)"));
+
+  // Turn ON Emergency Light (NeoPixel - Solid Red)
+  setEmergencyLightColor(emergencyLight.Color(255, 0, 0));
+  Serial.println(F("Emergency Light ON (Red)"));
+
+  // Turn ON Pin 5 Light (as Emergency Light is ON)
+  digitalWrite(PIN5_LIGHT_PIN, HIGH);
+  Serial.println(F("Pin 5 Light ON (System Stopped)"));
+
+  Serial.println(F("Press the button again to resume...\n"));
+
+  // --- Resume Logic ---
+  // 1. Wait for the button to be released (prevent immediate resume)
+  delay(50); // Small delay to ensure button state is stable
+  while (digitalRead(BUTTON_PIN) == LOW) {
+    delay(20); // Wait while button is held down
   }
+  Serial.println(F("Button released. Waiting for resume press..."));
+
+  // 2. Wait for the button to be pressed again to resume
+  while (digitalRead(BUTTON_PIN) == HIGH) {
+    delay(20); // Wait for the press
+  }
+   Serial.println(F("Resume button pressed. Releasing..."));
+
+  // 3. Wait for the button to be released again before actually resuming
+  delay(50); // Debounce release
+  while (digitalRead(BUTTON_PIN) == LOW) {
+    delay(20); // Wait while button is held down
+  }
+  Serial.println(F("Button released. Resuming system..."));
+
+  resumeSystem(); // Call resume function
 }
 
-void turnOffEmergencyLights() {
-  if (emergencyLightsOn) {
-    for(int i = 0; i < NUM_LEDS; i++) {
-      strip.setPixelColor(i, strip.Color(0, 0, 0));  // Turn off (RGB: 0,0,0)
-    }
-    strip.show();
-    emergencyLightsOn = false;
-    Serial.println(F("Emergency lights deactivated"));
+void resumeSystem() {
+  systemStopped = false; // Clear the stopped flag
+  cushionDeployed = false; // Reset the cushion deployed flag (assuming manual retraction)
+  fallDetectionCount = 0;
+  fallReason = FALL_REASON_NONE;
+  resumeInProgress = true; // Set the resume flag to prevent immediate fall detection
+
+  // Clear speed/acceleration buffers
+  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
+    speedBuffer[i] = 0;
+    accelBuffer[i] = 0;
   }
+
+  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
+  Serial.println(F("!!!!         SYSTEM RESUMED         !!!!"));
+  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
+  Serial.println(F("Stabilizing readings..."));
+
+  // Retract cushion servo 1
+  cushionServo1.write(SERVO_RETRACTED_POS);
+  Serial.println(F("Cushion Servo 1 Retracted"));
+
+  // Turn OFF Emergency Light (NeoPixel)
+  setEmergencyLightColor(emergencyLight.Color(0, 0, 0));
+  Serial.println(F("Emergency Light OFF"));
+
+  // Pin 5 light state will be determined by position in the next processData cycle
+
+  // Reset measurement timing and get current distance
+  lastMeasurementTime = millis();
+  prevTime = millis();
+  prevDistance = getStableDistance(); // Get a fresh reading
+  firstReading = true; // Force "Initializing" print on next processData
+  printTableHeader(); // Reprint table header
 }
 
-// Initialize stair lighting system
-void initializeStairLights() {
-  for (int i = 0; i < NUM_STAIR_LEDS; i++) {
-    pinMode(stairLedPins[i], OUTPUT);
-    analogWrite(stairLedPins[i], 0);  // Use analogWrite for PWM
-    stairLightsActive[i] = false;
-    stairLightTimers[i] = 0;
-    stairLightBrightness[i] = 0;
-    stairLightFading[i] = false;
+void deployCushion(int reason, float speed, float acceleration, float distanceChange) {
+  // Only deploy if not already deployed and not resuming
+  if (cushionDeployed || resumeInProgress) return;
+
+  // Deploy cushion servo 1
+  cushionServo1.write(SERVO_DEPLOYED_POS);
+  cushionDeployed = true; // Set deployed flag
+
+  // Turn ON Emergency Light (NeoPixel - Flashing Red)
+  setEmergencyLightColor(emergencyLight.Color(255, 0, 0)); // Start with red
+  Serial.println(F("Emergency Light ON (Flashing Red) - Fall Detected"));
+
+  String reasonText = getFallReasonText(reason, speed, acceleration, distanceChange);
+
+  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
+  Serial.println(F("!!!!     CUSHION 1 DEPLOYED       !!!!")); // Updated message
+  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"));
+
+  Serial.println(reasonText);
+  Serial.println(F("\n----- Fall Detection Details -----"));
+  Serial.print(F("Position on stairs: "));
+  float positionPct = getPositionOnStairs(prevDistance); // Use distance before fall
+  Serial.print(positionPct, 1);
+  Serial.println(F("% down the staircase"));
+
+  // Print speed and acceleration history
+  Serial.println(F("\nSpeed readings history (m/s):"));
+  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
+    int idx = (speedBufferIndex - 1 - i + CONSECUTIVE_READINGS) % CONSECUTIVE_READINGS;
+    Serial.print(F("  Reading -")); Serial.print(i+1); Serial.print(F(": ")); Serial.println(speedBuffer[idx], 2);
   }
-  Serial.println(F("Stair lights initialized"));
+  Serial.println(F("\nAcceleration readings history (m/s²):"));
+  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
+    int idx = (accelBufferIndex - 1 - i + CONSECUTIVE_READINGS) % CONSECUTIVE_READINGS;
+    Serial.print(F("  Reading -")); Serial.print(i+1); Serial.print(F(": ")); Serial.println(accelBuffer[idx], 2);
+  }
+  Serial.println(F("\n---------------------------------"));
+  Serial.println(F("System halted until button pressed to resume."));
+
+  // ---  Blink the NeoPixel ---
+  unsigned long blinkStartTime = millis();
+  while (systemStopped == false)
+  {
+     if (millis() - blinkStartTime > 500)  // Toggle every 500ms
+     {
+        if (emergencyLight.getPixelColor(0) == emergencyLight.Color(255, 0, 0))
+           setEmergencyLightColor(emergencyLight.Color(0, 0, 0));
+        else
+           setEmergencyLightColor(emergencyLight.Color(255, 0, 0));
+        blinkStartTime = millis();
+     }
+  }
+  //  The above while loop will only exit when the systemStopped becomes false
+  //  which happens inside the resumeSystem()
 }
 
-// Turn off all stair lights
-void turnOffAllStairLights() {
-  for (int i = 0; i < NUM_STAIR_LEDS; i++) {
-    analogWrite(stairLedPins[i], 0);
-    stairLightsActive[i] = false;
-    stairLightTimers[i] = 0;
-    stairLightBrightness[i] = 0;
-    stairLightFading[i] = false;
-  }
-  climbingUp = false;
-  climbingDown = false;
-  currentStairLightIndex = 0;
-  fallLightsActive = false;
-}
 
-// Fade in a stair light
-void fadeInStairLight(int index) {
-  if (index >= 0 && index < NUM_STAIR_LEDS) {
-    stairLightsActive[index] = true;
-    stairLightTimers[index] = millis();
-    stairLightBrightness[index] = 255;  // Set to full brightness immediately
-    analogWrite(stairLedPins[index], 255);
-  }
-}
-
-// Start fade out process for a stair light
-void fadeOutStairLight(int index) {
-  if (index >= 0 && index < NUM_STAIR_LEDS && stairLightsActive[index] && !stairLightFading[index]) {
-    stairLightFading[index] = true;
-  }
-}
-
-// Update fading lights
-void updateFadingStairLights() {
-  for (int i = 0; i < NUM_STAIR_LEDS; i++) {
-    if (stairLightFading[i] && stairLightBrightness[i] > 0) {
-      // Decrease brightness
-      stairLightBrightness[i] -= 255 / STAIR_FADE_STEPS;
-      if (stairLightBrightness[i] <= 0) {
-        stairLightBrightness[i] = 0;
-        stairLightsActive[i] = false;
-        stairLightFading[i] = false;
-      }
-      analogWrite(stairLedPins[i], stairLightBrightness[i]);
-      delay(STAIR_FADE_DELAY / NUM_STAIR_LEDS);  // Small delay to make fade visible
-    }
-  }
-}
-
-// Keep all stair lights on during fall detection
-void keepStairLightsOnForFall() {
-  fallLightsActive = true;
-  for (int i = 0; i < NUM_STAIR_LEDS; i++) {
-    if (!stairLightsActive[i]) {
-      fadeInStairLight(i);
-    }
-    // Make sure they don't start fading
-    stairLightFading[i] = false;
-  }
-}
-
-// Check and update stair light status based on timers
-void updateStairLightStatus() {
-  unsigned long currentTime = millis();
-  
-  // Don't update lights if there's a fall (they should stay on)
-  if (fallLightsActive) return;
-  
-  // Start fade out for any lights that have exceeded their duration
-  for (int i = 0; i < NUM_STAIR_LEDS; i++) {
-    if (stairLightsActive[i] && !stairLightFading[i] && 
-        currentTime - stairLightTimers[i] >= STAIR_LIGHT_DURATION) {
-      fadeOutStairLight(i);
-    }
-  }
-  
-  // Continue light sequence if currently climbing
-  if ((climbingUp || climbingDown) && currentTime - lastClimbingDetectionTime >= STAIR_SEQUENCE_DELAY) {
-    updateStairLightSequence();
-    lastClimbingDetectionTime = currentTime;
-  }
-}
-
-// Start upward climbing light sequence (2->3->4->5)
-void triggerUpwardLightSequence() {
-  if (!climbingUp) {
-    climbingUp = true;
-    climbingDown = false;
-    currentStairLightIndex = 0;
-    lastClimbingDetectionTime = millis();
-    
-    // Turn on first light
-    fadeInStairLight(currentStairLightIndex);
-    
-    Serial.println(F("Upward stair light sequence started"));
-  }
-}
-
-// Start downward climbing light sequence (5->4->3->2)
-void triggerDownwardLightSequence() {
-  if (!climbingDown) {
-    climbingUp = false;
-    climbingDown = true;
-    currentStairLightIndex = NUM_STAIR_LEDS - 1;
-    lastClimbingDetectionTime = millis();
-    
-    // Turn on first light
-    fadeInStairLight(currentStairLightIndex);
-    
-    Serial.println(F("Downward stair light sequence started"));
-  }
-}
-
-// Update stair light sequence based on direction
-void updateStairLightSequence() {
-  if (climbingUp) {
-    currentStairLightIndex++;
-    if (currentStairLightIndex >= NUM_STAIR_LEDS) {
-      climbingUp = false;  // End of sequence
-      return;
-    }
-  } else if (climbingDown) {
-    currentStairLightIndex--;
-    if (currentStairLightIndex < 0) {
-      climbingDown = false;  // End of sequence
-      return;
-    }
-  } else {
-    return;  // Not in a sequence
-  }
-  
-  // Turn on next light in sequence
-  fadeInStairLight(currentStairLightIndex);
+// --- NeoPixel Function ---
+void setEmergencyLightColor(uint32_t color) {
+  emergencyLight.setPixelColor(0, color);
+  emergencyLight.show();
 }
 
 bool isAtTopOfStairs(float distance) {
+  if (!isValidDistance(distance)) return false;
   return (distance < TOP_STAIR_ZONE);
 }
 
 bool isAtBottomOfStairs(float distance) {
+  if (!isValidDistance(distance) || stairHeight <= 0) return false;
+  // Check if distance is within BOTTOM_STAIR_ZONE cm of the calibrated stairHeight
   return (abs(distance - stairHeight) < BOTTOM_STAIR_ZONE);
 }
 
 float getPositionOnStairs(float distance) {
-  if (stairHeight <= 0) return 0;
-  return (distance / stairHeight) * 100.0;
+  if (stairHeight <= 0 || !isValidDistance(distance)) return 0;
+  float clampedDistance = constrain(distance, 0, stairHeight);
+  return (clampedDistance / stairHeight) * 100.0;
 }
 
 float getStableDistance() {
+  // Shift buffer
   for (int i = DISTANCE_DEBOUNCE - 1; i > 0; i--) {
     distanceBuffer[i] = distanceBuffer[i - 1];
   }
+  // Get new reading
+  distanceBuffer[0] = measureDistance();
 
-  float newReading = measureDistance();
-  
-  if (!isValidDistance(newReading)) {
-    for (int i = 1; i < DISTANCE_DEBOUNCE; i++) {
-      if (isValidDistance(distanceBuffer[i])) {
-        newReading = distanceBuffer[i];
-        break;
-      }
-    }
-  }
-  
-  distanceBuffer[0] = newReading;
-
+  // Use median filtering of VALID readings
   float tempBuffer[DISTANCE_DEBOUNCE];
+  int validCount = 0;
   for (int i = 0; i < DISTANCE_DEBOUNCE; i++) {
-    tempBuffer[i] = distanceBuffer[i];
+      if (isValidDistance(distanceBuffer[i])){
+         tempBuffer[validCount++] = distanceBuffer[i];
+      }
   }
-  
-  for (int i = 0; i < DISTANCE_DEBOUNCE - 1; i++) {
-    for (int j = 0; j < DISTANCE_DEBOUNCE - i - 1; j++) {
+
+  if (validCount == 0) {
+      return distanceBuffer[0]; // Return raw reading if no valid ones in buffer
+  }
+
+  // Sort valid readings (simple bubble sort for small array)
+  for (int i = 0; i < validCount - 1; i++) {
+    for (int j = 0; j < validCount - i - 1; j++) {
       if (tempBuffer[j] > tempBuffer[j + 1]) {
         float temp = tempBuffer[j];
         tempBuffer[j] = tempBuffer[j + 1];
@@ -421,28 +393,35 @@ float getStableDistance() {
       }
     }
   }
-  
-  return tempBuffer[DISTANCE_DEBOUNCE / 2];
+  // Return the median
+  return tempBuffer[validCount / 2];
 }
 
+
 bool isValidDistance(float distance) {
+  // Check if distance is within the defined min/max range
   return (distance >= MIN_VALID_DISTANCE && distance <= MAX_VALID_DISTANCE);
 }
 
 void calibrateStairHeight() {
   Serial.println(F("Starting stair height calibration..."));
-
-  // Make sure all stair lights are off during calibration
-  turnOffAllStairLights();
+  // Ensure lights are off during calibration
+  digitalWrite(PIN5_LIGHT_PIN, LOW);
+  setEmergencyLightColor(emergencyLight.Color(0,0,0));
 
   float totalDistance = 0;
   int validReadings = 0;
   unsigned long startTime = millis();
   int readingCount = 0;
+  float readings[CALIBRATION_TIME / CALIBRATION_INTERVAL];
+  int readingsIndex = 0;
 
   while (millis() - startTime < CALIBRATION_TIME) {
     if (digitalRead(BUTTON_PIN) == LOW) {
-      stopSystem();
+      Serial.println(F("Calibration interrupted by button press."));
+      // Don't call stopSystem here, just halt calibration
+      systemHalted = true; // Halt system if button pressed during calibration
+      Serial.println(F("SYSTEM HALTED due to button press during calibration."));
       return;
     }
 
@@ -452,207 +431,183 @@ void calibrateStairHeight() {
     if (isValidDistance(distance)) {
       totalDistance += distance;
       validReadings++;
-      Serial.print(F("Reading #"));
-      Serial.print(readingCount);
-      Serial.print(F(": "));
-      Serial.print(distance);
-      Serial.println(F(" cm"));
+      if (readingsIndex < (CALIBRATION_TIME / CALIBRATION_INTERVAL)) {
+          readings[readingsIndex++] = distance;
+      }
+      Serial.print(F("Reading #")); Serial.print(readingCount); Serial.print(F(": ")); Serial.print(distance, 1); Serial.println(F(" cm"));
     } else {
-      Serial.print(F("Reading #"));
-      Serial.print(readingCount);
-      Serial.println(F(": Invalid (skipped)"));
+      Serial.print(F("Reading #")); Serial.print(readingCount); Serial.println(F(": Invalid (skipped)"));
     }
-
     delay(CALIBRATION_INTERVAL);
   }
 
-  if (validReadings > 0) {
+  // Require a reasonable number of valid readings
+  if (validReadings > (CALIBRATION_TIME / CALIBRATION_INTERVAL) * 0.5) {
     stairHeight = totalDistance / validReadings;
-    Serial.print(F("\nCalibration complete! Average Distance: "));
-    Serial.print(stairHeight);
-    Serial.println(F(" cm"));
-    Serial.print(F("Top safety zone: 0-"));
-    Serial.print(TOP_STAIR_ZONE);
-    Serial.println(F(" cm (fall detection disabled)"));
+    Serial.print(F("\nCalibration complete! Average Distance (Stair Height): ")); Serial.print(stairHeight, 1); Serial.println(F(" cm"));
+    Serial.print(F("Top safety zone: 0 - ")); Serial.print(TOP_STAIR_ZONE, 1); Serial.println(F(" cm"));
+    Serial.print(F("Bottom safety zone: ")); Serial.print(stairHeight - BOTTOM_STAIR_ZONE, 1); Serial.print(F(" - ")); Serial.print(stairHeight, 1); Serial.println(F(" cm"));
+
+    // Stability check
+    float sumSqDiff = 0;
+    for(int i=0; i<validReadings; i++) { sumSqDiff += pow(readings[i] - stairHeight, 2); }
+    float stdDev = sqrt(sumSqDiff / validReadings);
+    Serial.print(F("Calibration reading stability (Std Dev): ")); Serial.print(stdDev, 2); Serial.println(F(" cm"));
+    if (stdDev > 5.0) { Serial.println(F("Warning: Calibration readings seem unstable. Check sensor placement.")); }
+
   } else {
-    Serial.println(F("\n!!!! CALIBRATION FAILED - NO VALID READINGS !!!!"));
+    Serial.println(F("\n!!!! CALIBRATION FAILED - INSUFFICIENT VALID READINGS !!!!"));
     Serial.println(F("!!!! SYSTEM HALTED FOR SAFETY !!!!"));
     systemHalted = true;
   }
-
-  Serial.println(F("------------------------------------"));
+  Serial.println(F("-----------------------------------------------------"));
 }
 
 int detectFallReason(float speed, float accel, float distanceChange, float currentDistance) {
-  // If we just resumed, don't detect falls immediately to prevent false positives
-  if (resumeInProgress) {
-    return FALL_REASON_NONE;
-  }
-  
-  if (isAtTopOfStairs(currentDistance)) {
-    return FALL_REASON_NONE;
-  }
-  
-  int highSpeedCount = 0;
-  
-  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
-    if (abs(speedBuffer[i]) > FALL_SPEED_THRESHOLD) {
-      highSpeedCount++;
-    }
-  }
-  
+  if (resumeInProgress) return FALL_REASON_NONE;
+  if (isAtTopOfStairs(currentDistance) || isAtBottomOfStairs(currentDistance)) return FALL_REASON_NONE;
+
+  int highSpeedDownCount = 0;
+  int highSpeedUpCount = 0;
   int highAccelCount = 0;
   float accelThreshold = 3.0;
-  
+  int requiredConsecutive = CONSECUTIVE_READINGS - 1;
+
   for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
-    if (abs(accelBuffer[i]) > accelThreshold) {
-      highAccelCount++;
-    }
+      if (speedBuffer[i] > FALL_SPEED_THRESHOLD) highSpeedDownCount++;
+      if (speedBuffer[i] < -FALL_SPEED_THRESHOLD * 1.2) highSpeedUpCount++; // Slightly higher threshold for backwards
+      if (abs(accelBuffer[i]) > accelThreshold) highAccelCount++;
   }
-  
-  if (highSpeedCount >= CONSECUTIVE_READINGS - 1) {
-    if (speed > FALL_SPEED_THRESHOLD && distanceChange > 0) {
-      return FALL_REASON_SPEED_DOWN;
-    }
-    
-    if (speed < -FALL_SPEED_THRESHOLD * 1.5) {
-      return FALL_REASON_SPEED_UP;
-    }
-  }
-  
-  if (highAccelCount >= CONSECUTIVE_READINGS - 1 && abs(accel) > accelThreshold) {
-    return FALL_REASON_ACCELERATION;
-  }
-  
-  if (!isAtBottomOfStairs(prevDistance) && isAtBottomOfStairs(currentDistance) && distanceChange > SUDDEN_DROP_THRESHOLD) {
-    return FALL_REASON_SUDDEN_DROP;
-  }
-  
+
+  // Check conditions based on buffered and current values
+  if (highSpeedDownCount >= requiredConsecutive && speed > FALL_SPEED_THRESHOLD) return FALL_REASON_SPEED_DOWN;
+  if (highSpeedUpCount >= requiredConsecutive && speed < -FALL_SPEED_THRESHOLD * 1.2) return FALL_REASON_SPEED_UP;
+  if (highAccelCount >= requiredConsecutive && abs(accel) > accelThreshold * 0.8) return FALL_REASON_ACCELERATION;
+  if (!isAtBottomOfStairs(prevDistance) && distanceChange > SUDDEN_DROP_THRESHOLD) return FALL_REASON_SUDDEN_DROP;
+
   return FALL_REASON_NONE;
 }
 
+
 String getFallReasonText(int reason, float speed, float accel, float distanceChange) {
   String text = "FALL DETECTED! ";
-  
   switch (reason) {
-    case FALL_REASON_SPEED_DOWN:
-      text += "Forward Down Stairs";
-      text += "\nReason: High downward speed (" + String(speed, 2) + " m/s)";
-      text += "\nDistance increasing by " + String(distanceChange, 1) + " cm";
-      text += "\nCriteria: Speed > " + String(FALL_SPEED_THRESHOLD, 2) + " m/s";
-      break;
-      
-    case FALL_REASON_SPEED_UP:
-      text += "Backwards Fall";
-      text += "\nReason: High upward speed (" + String(speed, 2) + " m/s)";
-      text += "\nDistance decreasing by " + String(abs(distanceChange), 1) + " cm";
-      text += "\nCriteria: Speed < -" + String(FALL_SPEED_THRESHOLD * 1.5, 2) + " m/s";
-      break;
-      
-    case FALL_REASON_ACCELERATION:
-      text += "Sudden Movement";
-      text += "\nReason: High acceleration (" + String(accel, 2) + " m/s²)";
-      text += "\nSpeed changing rapidly from " + String(speedBuffer[(accelBufferIndex-2+CONSECUTIVE_READINGS)%CONSECUTIVE_READINGS], 2);
-      text += " to " + String(speed, 2) + " m/s";
-      break;
-    
-    case FALL_REASON_SUDDEN_DROP:
-      text += "Sudden Drop";
-      text += "\nReason: Distance dropped suddenly by " + String(distanceChange, 1) + " cm";
-      text += "\nCriteria: Distance change > " + String(SUDDEN_DROP_THRESHOLD, 1) + " cm";
-      break;
-      
-    default:
-      text += "Unknown Reason";
+    case FALL_REASON_SPEED_DOWN: text += "Forward Down Stairs\nReason: High downward speed (" + String(speed, 2) + " m/s sustained)"; break;
+    case FALL_REASON_SPEED_UP: text += "Backwards Fall\nReason: High upward speed (" + String(speed, 2) + " m/s sustained)"; break;
+    case FALL_REASON_ACCELERATION: text += "Sudden Movement\nReason: High acceleration (" + String(accel, 2) + " m/s² sustained)"; break;
+    case FALL_REASON_SUDDEN_DROP: text += "Sudden Drop\nReason: Distance increased suddenly by " + String(distanceChange, 1) + " cm"; break;
+    default: text += "Unknown Reason";
   }
-  
   return text;
 }
 
 String getMovementStatus(float speed, float accel, float distanceChange, float currentDistance) {
-  if (isAtTopOfStairs(currentDistance)) {
-    return "At Top of Stairs";
+  // Simplified status - primarily for logging, as lights are handled separately now
+  if (isAtTopOfStairs(currentDistance)) return "At Top";
+  if (isAtBottomOfStairs(currentDistance)) return "At Bottom";
+  if (abs(speed) < CLIMBING_SPEED_THRESHOLD) return "Stationary";
+  if (speed < -CLIMBING_SPEED_THRESHOLD) return "Climbing Up";
+  if (speed > CLIMBING_SPEED_THRESHOLD) {
+      // Optional: Add back fast descent warning if needed for logging
+       if (speed > FALL_SPEED_THRESHOLD * 0.8) {
+           fallDetectionCount++;
+           if (fallDetectionCount >= 2) return "Fast Descent";
+       } else {
+           fallDetectionCount = 0;
+       }
+      return "Climbing Down";
   }
-  
-  if (isAtBottomOfStairs(currentDistance)) {
-    return "At Bottom of Stairs";
-  }
-
-  if (abs(speed) < CLIMBING_SPEED_THRESHOLD) {
-    return "Stationary";
-  }
-  
-  if (speed < -CLIMBING_SPEED_THRESHOLD && distanceChange < 0) {
-    // Climbing up - trigger upward light sequence
-    triggerUpwardLightSequence();
-    return "Climbing Up";
-  }
-  
-  if (speed > CLIMBING_SPEED_THRESHOLD && distanceChange > 0) {
-    // Climbing down - trigger downward light sequence
-    triggerDownwardLightSequence();
-    
-    if (speed > FALL_SPEED_THRESHOLD) {
-      fallDetectionCount++;
-      if (fallDetectionCount >= 2) {
-        return "Fall Warning";
-      }
-    }
-    return "Climbing Down";
-  }
-  
-  fallDetectionCount = 0;
-  return "Monitoring";
+  return "Monitoring"; // Default/transient state
 }
 
-void processData(unsigned long currentTime, float currentDistance, float speed, float accel, float distanceChange) {
-  if (systemStopped) return;
 
+void processData(unsigned long currentTime, float currentDistance, float speed, float accel, float distanceChange) {
+  // Skip processing if system is stopped or halted
+  if (systemStopped || systemHalted) return;
+
+  // Handle first reading after startup/resume
   if (firstReading) {
     printTableRow(currentTime, currentDistance, 0, 0, 0, "Initializing");
     firstReading = false;
+    // Set initial state for Pin 5 light based on first reading
+    if (isAtBottomOfStairs(currentDistance)) {
+        digitalWrite(PIN5_LIGHT_PIN, LOW);
+    } else {
+        digitalWrite(PIN5_LIGHT_PIN, HIGH);
+    }
+    prevDistance = currentDistance; // Initialize prevDistance
+    prevTime = currentTime;         // Initialize prevTime
     return;
   }
 
+  // Handle invalid sensor readings
   if (!isValidDistance(currentDistance)) {
-    printTableRow(currentTime, currentDistance, speed, accel, distanceChange, "ERROR: Invalid Value");
+    printTableRow(currentTime, currentDistance, 0, 0, 0, "ERROR: Invalid Reading");
+    // Keep Pin 5 light in its previous state during invalid reading? Or turn ON? Let's keep previous state.
+    // Don't update prevDistance
+    prevTime = currentTime; // Still update time
     return;
   }
 
+  // --- Control Pin 5 Light ---
+  // Pin 5 light is ON if system is stopped OR if person is NOT at bottom.
+  // Pin 5 light is OFF only if system is RUNNING AND person IS at bottom.
+  if (systemStopped) { // This check is redundant if processData isn't called when stopped, but safe to keep
+       digitalWrite(PIN5_LIGHT_PIN, HIGH);
+  } else {
+      if (isAtBottomOfStairs(currentDistance)) {
+          digitalWrite(PIN5_LIGHT_PIN, LOW); // Turn OFF only if at bottom AND system running
+      } else {
+          digitalWrite(PIN5_LIGHT_PIN, HIGH); // Turn ON if not at bottom AND system running
+      }
+  }
+
+  // Determine current movement status for logging
   String status = getMovementStatus(speed, accel, distanceChange, currentDistance);
-  
-  // Clear the resumeInProgress flag after a few valid readings
+
+  // Handle the 'Resuming' state transition
   if (resumeInProgress) {
     static int validReadingsAfterResume = 0;
     validReadingsAfterResume++;
+    status = "Resuming..."; // Override status during resume phase
     if (validReadingsAfterResume >= CONSECUTIVE_READINGS) {
       resumeInProgress = false;
       validReadingsAfterResume = 0;
-      status = "Resume Complete";
-    } else {
-      status = "Resuming...";
-    }
-  } else if (!isAtTopOfStairs(currentDistance)) {
-    fallReason = detectFallReason(speed, accel, distanceChange, currentDistance);
-    
-    if (fallReason != FALL_REASON_NONE) {
-      status = "FALL DETECTED!";
-      keepStairLightsOnForFall();  // Keep stair lights on during fall
-      deployCushion(fallReason, speed, accel, distanceChange);
+      status = "Monitoring"; // Switch to normal monitoring status
+      Serial.println(F("Resume complete. Monitoring active."));
     }
   } else {
-    fallDetectionCount = 0;
+      // Perform fall detection ONLY if not resuming and not in safe zones
+      if (!isAtTopOfStairs(currentDistance) && !isAtBottomOfStairs(currentDistance)) {
+          fallReason = detectFallReason(speed, accel, distanceChange, currentDistance);
+          if (fallReason != FALL_REASON_NONE) {
+              status = "FALL DETECTED!"; // Override status for printing
+              deployCushion(fallReason, speed, accel, distanceChange);
+              // deployCushion sets cushionDeployed flag, stopping further processing in loop()
+          }
+      } else {
+          fallDetectionCount = 0; // Reset fall warning count if in a safe zone
+      }
   }
 
-  printTableRow(currentTime, currentDistance, speed, accel, distanceChange, status.c_str());
+  // Print the status row for this cycle, unless cushion just deployed
+  if (!cushionDeployed) {
+     printTableRow(currentTime, currentDistance, speed, accel, distanceChange, status.c_str());
+  }
+
+  // Update previous values for the next iteration *after* all calculations using them are done
+  // These are already updated at the end of loop() if the reading was valid.
 }
 
+
 float calculateSpeed(float distDiff, float timeDiff) {
-  return (timeDiff > 0.001) ? (distDiff / 100.0) / timeDiff : 0;
+  if (timeDiff <= 0.0001) return 0;
+  return (distDiff / 100.0) / timeDiff; // cm to m
 }
 
 float calculateAcceleration(float speedDiff, float timeDiff) {
-  return (timeDiff > 0.001) ? speedDiff / timeDiff : 0;
+  if (timeDiff <= 0.0001) return 0;
+  return speedDiff / timeDiff;
 }
 
 float measureDistance() {
@@ -662,170 +617,49 @@ float measureDistance() {
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 25000);
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
 
   if (duration == 0) {
-    return 0;
+    return -1.0; // Indicate timeout/error
   }
 
-  return duration * 0.034 / 2;
+  float distance = duration * 0.0343 / 2.0;
+  // Return raw distance, validation happens later
+  return distance;
 }
 
-void deployCushion(int reason, float speed, float acceleration, float distanceChange) {
-  if (cushionDeployed || resumeInProgress) return;  // Don't deploy if we're resuming
-
-  // Keep all stair lights on during fall detection
-  keepStairLightsOnForFall();
-
-  // Deploy both servos
-  cushionServo1.write(SERVO_DEPLOYED_POS);  // 90 degrees
-  cushionServo2.write(SERVO_DEPLOYED_POS);  // 90 degrees
-  cushionDeployed = true;
-  
-  // Turn on emergency lights
-  turnOnEmergencyLights();
-
-  String reasonText = getFallReasonText(reason, speed, acceleration, distanceChange);
-
-  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!       CUSHION DEPLOYED       !!!!"));
-  Serial.println(F("!!!!     EMERGENCY LIGHTS ON      !!!!"));
-  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"));
-  
-  Serial.println(reasonText);
-  Serial.println(F("\n----- Fall Detection Details -----"));
-  Serial.print(F("Position on stairs: "));
-  
-  float positionPct = getPositionOnStairs(prevDistance);
-  Serial.print(positionPct, 1);
-  Serial.println(F("% down the staircase"));
-  
-  Serial.println(F("\nSpeed readings history (m/s):"));
-  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
-    int idx = (speedBufferIndex - 1 - i + CONSECUTIVE_READINGS) % CONSECUTIVE_READINGS;
-    Serial.print(F("  Reading -"));
-    Serial.print(i+1);
-    Serial.print(F(": "));
-    Serial.println(speedBuffer[idx], 2);
-  }
-  
-  Serial.println(F("\nAcceleration readings history (m/s²):"));
-  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
-    int idx = (accelBufferIndex - 1 - i + CONSECUTIVE_READINGS) % CONSECUTIVE_READINGS;
-    Serial.print(F("  Reading -"));
-    Serial.print(i+1);
-    Serial.print(F(": "));
-    Serial.println(accelBuffer[idx], 2);
-  }
-  
-  Serial.println(F("\n---------------------------------"));
-}
 
 void printTableHeader() {
-  Serial.println(F("+------------+-----------+-----------+-----------+------------+----------------------+"));
-  Serial.println(F("|     Time     | Distance  |   Speed     |   Accel.    |  Distance   |         Status                 |"));
-  Serial.println(F("|     (ms)     |    (cm)    |    (m/s)    |   (m/s²)    |    Change    |                                  |"));
-  Serial.println(F("+------------+-----------+-----------+-----------+------------+----------------------+"));
+  Serial.println(F("+------------+-----------+-----------+-----------+------------+-------------------------+"));
+  Serial.println(F("|   Time(ms) | Dist (cm) | Speed(m/s)| Accel(m/s²)| Chg (cm)   | Status                  |"));
+  Serial.println(F("+------------+-----------+-----------+-----------+------------+-------------------------+"));
 }
 
 void printTableRow(unsigned long time, float distance, float speed, float accel, float distChange, const char* status) {
+  char buffer[12];
+
   Serial.print(F("| "));
-  printWithPadding(String(time), 10, true);
+  printWithPadding(String(time), 10, true); // Right align time
   Serial.print(F(" | "));
 
-  char buffer[10];
-  dtostrf(distance, 5, 1, buffer);
+  if (isValidDistance(distance)) { dtostrf(distance, 5, 1, buffer); }
+  else if (distance == -1.0) { strcpy(buffer, "Timeout"); }
+  else { strcpy(buffer, "Inv."); }
   printWithPadding(buffer, 9);
   Serial.print(F(" | "));
 
-  dtostrf(speed, 5, 2, buffer);
-  printWithPadding(buffer, 9);
-  Serial.print(F(" | "));
-
-  dtostrf(accel, 5, 2, buffer);
-  printWithPadding(buffer, 9);
-  Serial.print(F(" | "));
-
-  dtostrf(distChange, 6, 1, buffer);
-  printWithPadding(buffer, 10);
-  Serial.print(F(" | "));
-
-  printWithPadding(status, 20);
+  dtostrf(speed, 5, 2, buffer); printWithPadding(buffer, 9); Serial.print(F(" | "));
+  dtostrf(accel, 5, 2, buffer); printWithPadding(buffer, 9); Serial.print(F(" | "));
+  dtostrf(distChange, 6, 1, buffer); printWithPadding(buffer, 10); Serial.print(F(" | "));
+  printWithPadding(status, 23); // Left align status
   Serial.println(F(" |"));
 }
 
+
 void printWithPadding(String text, int width, bool rightAlign) {
-  int padding = width - text.length();
-  if (padding < 0) padding = 0;
-
-  if (rightAlign) {
-    for (int i = 0; i < padding; i++) Serial.print(' ');
-    Serial.print(text);
-  } else {
-    Serial.print(text);
-    for (int i = 0; i < padding; i++) Serial.print(' ');
-  }
-}
-
-void stopSystem() {
-  systemStopped = true;
-  
-  // Deploy both servos when button is pressed
-  cushionServo1.write(SERVO_DEPLOYED_POS);  // 90 degrees
-  cushionServo2.write(SERVO_DEPLOYED_POS);  // 90 degrees
-  
-  // Turn on emergency lights when system is stopped
-  turnOnEmergencyLights();
-
-  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!          SYSTEM STOPPED          !!!!"));
-  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("Press the button again to resume...\n"));
-
-  // Wait for button to be released first
-  while (digitalRead(BUTTON_PIN) == LOW) {
-    delay(50);
-  }
-  
-  // Wait for next button press to resume
-  while (digitalRead(BUTTON_PIN) == HIGH) {
-    delay(50);
-  }
-  
-  // Wait for button release
-  while (digitalRead(BUTTON_PIN) == LOW) {
-    delay(50);
-  }
-
-  resumeSystem();
-}
-
-void resumeSystem() {
-  systemStopped = false;
-  cushionDeployed = false;  // Reset the cushion deployed flag
-  fallDetectionCount = 0;
-  fallReason = FALL_REASON_NONE;
-  resumeInProgress = true;  // Set the resume flag to prevent immediate deployment
-  
-  for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
-    speedBuffer[i] = 0;
-    accelBuffer[i] = 0;
-  }
-  
-  Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!          SYSTEM RESUMED          !!!!"));
-  Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("Stabilizing readings..."));
-
-  // Retract both servos when resuming
-  cushionServo1.write(SERVO_RETRACTED_POS);  // 0 degrees
-  cushionServo2.write(SERVO_RETRACTED_POS);  // 0 degrees
-  
-  // Turn off emergency lights when system is resumed
-  turnOffEmergencyLights();
-
-  lastMeasurementTime = millis();
-  prevTime = millis();
-  prevDistance = getStableDistance();
-  printTableHeader();
+  int textLen = text.length();
+  int padding = width - textLen;
+  if (padding < 0) { text = text.substring(0, width); padding = 0; } // Truncate if too long
+  if (rightAlign) { for (int i = 0; i < padding; i++) Serial.print(' '); Serial.print(text); }
+  else { Serial.print(text); for (int i = 0; i < padding; i++) Serial.print(' '); }
 }
