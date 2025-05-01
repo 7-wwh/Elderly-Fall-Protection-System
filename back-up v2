@@ -1,35 +1,37 @@
 #include <Servo.h>
 #include <Adafruit_NeoPixel.h> // Include the NeoPixel library
 
-// Pin definitions
+// --- Define Section ---
+//  These values can be easily changed here
 #define TRIG_PIN 9
 #define ECHO_PIN 10
-#define SERVO1_PIN 6       // Servo 1 pin (PWM capable ~)
-// #define SERVO2_PIN 5     // Pin 5 is now used for a light, removing Servo 2
-#define BUTTON_PIN 7       // Button to stop/resume system
-#define PIN5_LIGHT_PIN 5   // Light indicating if NOT at bottom OR system stopped
+#define SERVO1_PIN 6         // Servo 1 pin (PWM capable ~)
+#define PIN5_LIGHT_PIN 5         // Light indicating if NOT at bottom OR system stopped
 #define EMERGENCY_LIGHT_PIN 8 // Data pin for the NeoPixel
+#define BUTTON_PIN 7         // Button to stop/resume system
+#define BUZZER_PIN 4         // Define the buzzer pin
 
-// Configuration parameters
 #define BAUD_RATE 9600
 #define CALIBRATION_TIME 5000
 #define CALIBRATION_INTERVAL 50
 #define LOOP_INTERVAL 50
-#define FALL_SPEED_THRESHOLD 0.5   // m/s
-#define HEIGHT_TOLERANCE 2.5       // cm
+#define FALL_SPEED_THRESHOLD 0.5         // m/s
+#define HEIGHT_TOLERANCE 2.5         // cm
 #define SERVO_RETRACTED_POS 0
-#define SERVO_DEPLOYED_POS 90
-#define MAX_VALID_DISTANCE 400     // cm
-#define MIN_VALID_DISTANCE 5       // cm
-#define DISTANCE_DEBOUNCE 5         // Number of readings for median filter
-#define CLIMBING_SPEED_THRESHOLD 0.05 // m/s - Minimal speed considered as movement
-#define CONSECUTIVE_READINGS 3     // Readings buffer size for speed/accel/fall detection
-#define TOP_STAIR_ZONE 5           // cm - Distance from top considered 'at top'
-#define BOTTOM_STAIR_ZONE 5        // cm - Distance from bottom considered 'at bottom'
-#define SUDDEN_DROP_THRESHOLD 30   // cm - Threshold for sudden drop detection
+#define SERVO_DEPLOYED_POS 120
+#define MAX_VALID_DISTANCE 400          // cm
+#define MIN_VALID_DISTANCE 5          // cm
+#define DISTANCE_DEBOUNCE 5          // Number of readings for median filter
+#define CLIMBING_SPEED_THRESHOLD 0.05  // m/s - Minimal speed considered as movement
+#define CONSECUTIVE_READINGS 3           // Readings buffer size for speed/accel/fall detection
+#define TOP_STAIR_ZONE 9           // cm - Distance from top considered 'at top'
+#define BOTTOM_STAIR_ZONE 9           // cm - Distance from bottom considered 'at bottom'
+#define SUDDEN_DROP_THRESHOLD 30           // cm - Threshold for sudden drop detection
+#define PIN5_LIGHT_OFF_DELAY 3000 // Delay in milliseconds for Pin 5 light off
 
 // NeoPixel Configuration
-#define NUM_LEDS 1         // Number of NeoPixels in the strip
+#define NUM_LEDS 8         // Number of NeoPixels in the strip
+// --- End Define Section ---
 
 
 // Fall detection reasons
@@ -40,9 +42,7 @@
 #define FALL_REASON_NONE 0
 
 // Global variables
-Servo cushionServo1; // Only one servo now
-// Servo cushionServo2; // Removed
-
+Servo cushionServo1;
 float stairHeight = 0;
 float prevDistance = 0;
 unsigned long prevTime = 0;
@@ -50,7 +50,7 @@ bool cushionDeployed = false;
 unsigned long lastMeasurementTime = 0;
 bool firstReading = true;
 bool systemStopped = false; // Flag: True if stopped by button
-bool systemHalted = false;   // Flag: True if calibration failed (permanent halt)
+bool systemHalted = false;          // Flag: True if calibration failed (permanent halt)
 float distanceBuffer[DISTANCE_DEBOUNCE];
 float speedBuffer[CONSECUTIVE_READINGS];
 float accelBuffer[CONSECUTIVE_READINGS];
@@ -60,9 +60,13 @@ int fallDetectionCount = 0; // Counter for consecutive fall warnings (e.g., fast
 int fallReason = FALL_REASON_NONE;
 bool resumeInProgress = false;  // Flag to track if a resume is in progress
 unsigned long buttonPressTime = 0; // To store the time of the button press for debouncing
+unsigned long pin5LightOffTime = 0;          // To store the time when Pin 5 light should be turned off
+unsigned long buzzerStartTime = 0; // To store the start time of the buzzer
+bool buzzerState = false; //to keep track of the buzzer's state
 
 // --- NeoPixel Variable ---
-Adafruit_NeoPixel emergencyLight = Adafruit_NeoPixel(NUM_LEDS, EMERGENCY_LIGHT_PIN);
+Adafruit_NeoPixel emergencyLight = Adafruit_NeoPixel(NUM_LEDS, EMERGENCY_LIGHT_PIN, NEO_GRB + NEO_KHZ800); //changed to use the NEO_GRB
+
 
 // Function prototypes
 float measureDistance();
@@ -84,6 +88,8 @@ bool isAtTopOfStairs(float distance);
 bool isAtBottomOfStairs(float distance);
 String getFallReasonText(int reason, float speed, float accel, float distanceChange);
 float getPositionOnStairs(float distance);
+void updateEmergencyLight();  // New function to handle emergency light
+void updateBuzzer(); // New function to handle the buzzer
 // --- NeoPixel Function Prototypes ---
 void setEmergencyLightColor(uint32_t color);
 
@@ -92,19 +98,18 @@ void setup() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(PIN5_LIGHT_PIN, OUTPUT);      // Initialize Pin 5 light output
+  pinMode(PIN5_LIGHT_PIN, OUTPUT);           // Initialize Pin 5 light output
+  pinMode(BUZZER_PIN, OUTPUT); // Initialize the BUZZER pin as OUTPUT
 
   cushionServo1.attach(SERVO1_PIN);
-  // cushionServo2.attach(SERVO2_PIN); // Removed
 
   // Initialize lights
   digitalWrite(PIN5_LIGHT_PIN, LOW); // Ensure standard light is off
-  emergencyLight.begin();         // Initialize the NeoPixel
-  emergencyLight.show();           // Turn off all pixels in case they are on
+  emergencyLight.begin();          // Initialize the NeoPixel
+  emergencyLight.show();            // Turn off all pixels in case they are on
 
-  // Set servo 1 to retracted position
+  // Set servo to retracted position
   cushionServo1.write(SERVO_RETRACTED_POS);
-  // cushionServo2.write(SERVO_RETRACTED_POS); // Removed
 
   // Initialize buffers
   for (int i = 0; i < DISTANCE_DEBOUNCE; i++) {
@@ -136,8 +141,14 @@ void setup() {
 void loop() {
   if (systemHalted) return; // Stop if calibration failed
 
-  // Check button status - stop system immediately if pressed
+  // Handle emergency light blinking and buzzer when cushion is deployed
   unsigned long currentTime = millis();
+  if (cushionDeployed && !systemStopped) {
+    updateEmergencyLight();
+    updateBuzzer(); //call the buzzer function
+  }
+
+  // Check button status - stop system immediately if pressed
   if (digitalRead(BUTTON_PIN) == LOW) {
     // Debounce the button press
     if (currentTime - buttonPressTime >= 100) { // 100ms debounce
@@ -150,12 +161,11 @@ void loop() {
     }
   }
 
-  // If system is stopped by button or cushion is deployed, do nothing further in loop
-  if (systemStopped || cushionDeployed) return;
-
+  // If system is stopped, do nothing further in loop
+  if (systemStopped) return;
 
   // Only measure and process data at defined intervals
-  if (currentTime - lastMeasurementTime < LOOP_INTERVAL) return;
+  if (cushionDeployed || currentTime - lastMeasurementTime < LOOP_INTERVAL) return;
   lastMeasurementTime = currentTime;
 
   // Get stable distance reading
@@ -192,6 +202,31 @@ void loop() {
   prevTime = currentTime;
 }
 
+// New function to handle emergency light
+void updateEmergencyLight() {
+  unsigned long currentTime = millis();
+    setEmergencyLightColor(emergencyLight.Color(255, 0, 0)); // Red
+}
+
+// Function to handle the buzzer sequence - nicer sound for 5 seconds only
+void updateBuzzer() {
+  unsigned long currentTime = millis();
+  unsigned long elapsedTime = currentTime - buzzerStartTime;
+  
+  // Only beep for 5 seconds (5000ms) after activation
+  if (elapsedTime > 500 && elapsedTime < 5500) {
+    // Create a more pleasant pattern - shorter beeps with varied timing
+    // 150ms on, 200ms off pattern creates a less harsh sound
+    if ((elapsedTime % 350) < 150) {
+      digitalWrite(BUZZER_PIN, HIGH); // Buzzer ON
+    } else {
+      digitalWrite(BUZZER_PIN, LOW);   // Buzzer OFF
+    }
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);     // Ensure buzzer is off outside the 5-second window
+  }
+}
+
 // --- Simplified Light Control (No dedicated functions needed) ---
 // Logic is integrated into stopSystem, resumeSystem, and processData
 
@@ -200,16 +235,19 @@ void stopSystem() {
 
   systemStopped = true;
   Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!          SYSTEM STOPPED          !!!!"));
+  Serial.println(F("!!!!                               SYSTEM STOPPED                               !!!!"));
   Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
 
-  // Deploy cushion servo 1
+  // Deploy cushion
   cushionServo1.write(SERVO_DEPLOYED_POS);
-  Serial.println(F("Cushion Servo 1 Deployed (Manual Stop)"));
+  Serial.println(F("Cushion Deployed (Manual Stop)"));
 
   // Turn ON Emergency Light (NeoPixel - Solid Red)
-  setEmergencyLightColor(emergencyLight.Color(255, 0, 0));
+  setEmergencyLightColor(emergencyLight.Color(255, 255, 255));
   Serial.println(F("Emergency Light ON (Red)"));
+
+  //also start the buzzer beeping
+  buzzerStartTime = millis();
 
   // Turn ON Pin 5 Light (as Emergency Light is ON)
   digitalWrite(PIN5_LIGHT_PIN, HIGH);
@@ -226,6 +264,8 @@ void resumeSystem() {
   fallDetectionCount = 0;
   fallReason = FALL_REASON_NONE;
   resumeInProgress = true; // Set the resume flag to prevent immediate fall detection
+  pin5LightOffTime = 0; // Reset the Pin 5 light off timer
+  buzzerStartTime = 0; // Reset buzzer timer
 
   // Clear speed/acceleration buffers
   for (int i = 0; i < CONSECUTIVE_READINGS; i++) {
@@ -234,17 +274,20 @@ void resumeSystem() {
   }
 
   Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!          SYSTEM RESUMED          !!!!"));
+  Serial.println(F("!!!!                               SYSTEM RESUMED                               !!!!"));
   Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
   Serial.println(F("Stabilizing readings..."));
 
-  // Retract cushion servo 1
+  // Retract cushion
   cushionServo1.write(SERVO_RETRACTED_POS);
-  Serial.println(F("Cushion Servo 1 Retracted"));
+  Serial.println(F("Cushion Retracted"));
 
   // Turn OFF Emergency Light (NeoPixel)
   setEmergencyLightColor(emergencyLight.Color(0, 0, 0));
   Serial.println(F("Emergency Light OFF"));
+
+  // Turn OFF Buzzer
+  digitalWrite(BUZZER_PIN, LOW);
 
   // Pin 5 light state will be determined by position in the next processData cycle
 
@@ -260,18 +303,21 @@ void deployCushion(int reason, float speed, float acceleration, float distanceCh
   // Only deploy if not already deployed and not resuming
   if (cushionDeployed || resumeInProgress) return;
 
-  // Deploy cushion servo 1
+  // Deploy cushion
   cushionServo1.write(SERVO_DEPLOYED_POS);
   cushionDeployed = true; // Set deployed flag
 
-  // Turn ON Emergency Light (NeoPixel - Flashing Red)
-  setEmergencyLightColor(emergencyLight.Color(255, 0, 0)); // Start with red
-  Serial.println(F("Emergency Light ON (Flashing Red) - Fall Detected"));
+  // Initialize blinking parameters
+  buzzerStartTime = millis();
+
+  // Turn ON Emergency Light (NeoPixel - starting with Red)
+  setEmergencyLightColor(emergencyLight.Color(255, 0, 0));
+  Serial.println(F("Emergency Light ON (Red) - Fall Detected"));
 
   String reasonText = getFallReasonText(reason, speed, acceleration, distanceChange);
 
   Serial.println(F("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"));
-  Serial.println(F("!!!!          CUSHION 1 DEPLOYED          !!!!")); // Updated message
+  Serial.println(F("!!!!                               CUSHION DEPLOYED                               !!!!"));
   Serial.println(F("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"));
 
   Serial.println(reasonText);
@@ -293,29 +339,17 @@ void deployCushion(int reason, float speed, float acceleration, float distanceCh
     Serial.print(F("  Reading -")); Serial.print(i + 1); Serial.print(F(": ")); Serial.println(accelBuffer[idx], 2);
   }
   Serial.println(F("\n---------------------------------"));
-  Serial.println(F("System halted until button pressed to resume."));
+  Serial.println(F("System waiting until button pressed to resume."));
 
-  // ---  Blink the NeoPixel ---
-  unsigned long blinkStartTime = millis();
-  while (systemStopped == false)
-  {
-    if (millis() - blinkStartTime > 500)   // Toggle every 500ms
-    {
-      if (emergencyLight.getPixelColor(0) == emergencyLight.Color(255, 0, 0))
-        setEmergencyLightColor(emergencyLight.Color(0, 0, 0));
-      else
-        setEmergencyLightColor(emergencyLight.Color(255, 0, 0));
-      blinkStartTime = millis();
-    }
-  }
-  //  The above while loop will only exit when the systemStopped becomes false
-  //  which happens inside the resumeSystem() which is now called from main loop
+  // Don't enter blocking while loop anymore - blinking is handled in the main loop
 }
 
 
 // --- NeoPixel Function ---
 void setEmergencyLightColor(uint32_t color) {
-  emergencyLight.setPixelColor(0, color);
+  for(int i=0; i<NUM_LEDS; i++){
+    emergencyLight.setPixelColor(i, color);
+  }
   emergencyLight.show();
 }
 
@@ -510,11 +544,13 @@ void processData(unsigned long currentTime, float currentDistance, float speed, 
     // Set initial state for Pin 5 light based on first reading
     if (isAtBottomOfStairs(currentDistance)) {
       digitalWrite(PIN5_LIGHT_PIN, LOW);
+      pin5LightOffTime = 0; // Clear any pending off time
     } else {
       digitalWrite(PIN5_LIGHT_PIN, HIGH);
+      pin5LightOffTime = 0;
     }
     prevDistance = currentDistance; // Initialize prevDistance
-    prevTime = currentTime;       // Initialize prevTime
+    prevTime = currentTime;          // Initialize prevTime
     return;
   }
 
@@ -522,21 +558,32 @@ void processData(unsigned long currentTime, float currentDistance, float speed, 
   if (!isValidDistance(currentDistance)) {
     printTableRow(currentTime, currentDistance, 0, 0, 0, "ERROR: Invalid Reading");
     // Keep Pin 5 light in its previous state during invalid reading? Or turn ON? Let's keep previous state.
-    // Don't update prevDistance
+    // Don't updateprevDistance
     prevTime = currentTime; // Still update time
     return;
   }
 
   // --- Control Pin 5 Light ---
   // Pin 5 light is ON if system is stopped OR if person is NOT at bottom.
-  // Pin 5 light is OFF only if system is RUNNING AND person IS at bottom.
+  // Pin 5 light is OFF (after delay) only if system is RUNNING AND person IS at bottom.
   if (systemStopped) { // This check is redundant if processData isn't called when stopped,but safe to keep
     digitalWrite(PIN5_LIGHT_PIN, HIGH);
+    pin5LightOffTime = 0; // Clear any pending off time
   } else {
     if (isAtBottomOfStairs(currentDistance)) {
-      digitalWrite(PIN5_LIGHT_PIN, LOW); // Turn OFF only if at bottom AND system running
+      // Start timer if just entered bottom zone and light is on
+      if (digitalRead(PIN5_LIGHT_PIN) == HIGH && pin5LightOffTime == 0) {
+        pin5LightOffTime = currentTime + PIN5_LIGHT_OFF_DELAY;
+      }
+      // Turn off light after delay
+      if (pin5LightOffTime != 0 && currentTime >= pin5LightOffTime) {
+        digitalWrite(PIN5_LIGHT_PIN, LOW);
+        pin5LightOffTime = 0; // Reset timer
+      }
     } else {
-      digitalWrite(PIN5_LIGHT_PIN, HIGH); // Turn ON if not at bottom AND system running
+      // Turn ON immediately if not at bottom
+      digitalWrite(PIN5_LIGHT_PIN, HIGH);
+      pin5LightOffTime = 0; // Clear any pending off time
     }
   }
 
@@ -603,10 +650,9 @@ float measureDistance() {
   return distance;
 }
 
-
 void printTableHeader() {
   Serial.println(F("+------------+-----------+-----------+-----------+------------+-------------------------+"));
-  Serial.println(F("|  Time(ms)  | Dist (cm) | Speed(m/s)| Accel(m/s²)| Chg (cm)   | Status                    |"));
+  Serial.println(F("|  Time(ms)  | Dist (cm) | Speed(m/s)| Accel(m/s²)| Chg (cm)    | Status                                  |"));
   Serial.println(F("+------------+-----------+-----------+-----------+------------+-------------------------+"));
 }
 
